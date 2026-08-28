@@ -14,10 +14,9 @@ from flask import Flask, render_template_string, request, jsonify
 from flask_socketio import SocketIO, emit
 import secrets
 
-# Import from your existing scripts
-sys.path.insert(0, os.path.dirname(__file__))
-from reclist import Config, OAuthPhishAgent
-from postexp import llamascout_analyse, llama_maverick_craft, send_email
+from .constants import TOKEN_FILE, CAMPAIGN_FILE
+from .reclist import Config, OAuthPhishAgent, PhishingEmailGenerator
+from .postexp import llamascout_analyse, llama_maverick_craft, send_email
 
 # ============================================================
 # FLASK APP SETUP
@@ -25,9 +24,6 @@ from postexp import llamascout_analyse, llama_maverick_craft, send_email
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
 socketio = SocketIO(app, cors_allowed_origins="*")
-
-# Groq API config
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 # Store data
 campaigns = []
@@ -40,10 +36,10 @@ last_analysis_results = {
 }
 
 def load_tokens():
-    """Load tokens from postexp.py's tokens.json"""
-    if os.path.exists('tokens.json'):
+    """Load tokens from data/tokens.json"""
+    if os.path.exists(TOKEN_FILE):
         try:
-            with open('tokens.json', 'r') as f:
+            with open(TOKEN_FILE, 'r') as f:
                 data = json.load(f)
                 return [{
                     'email': data.get('email', 'Unknown'),
@@ -57,14 +53,14 @@ def load_tokens():
     return []
 
 def save_campaigns():
-    with open('campaigns.json', 'w') as f:
+    with open(CAMPAIGN_FILE, 'w') as f:
         json.dump(campaigns, f, indent=2)
 
 def load_campaigns():
     global campaigns
-    if os.path.exists('campaigns.json'):
+    if os.path.exists(CAMPAIGN_FILE):
         try:
-            with open('campaigns.json', 'r') as f:
+            with open(CAMPAIGN_FILE, 'r') as f:
                 campaigns = json.load(f)
         except:
             campaigns = []
@@ -485,7 +481,6 @@ def api_campaigns():
 @app.route('/generate_oauth_link')
 def generate_oauth_link():
     config = Config()
-    from reclist import PhishingEmailGenerator
     generator = PhishingEmailGenerator(config, None)
     link = generator.generate_malicious_link()
     return jsonify({'link': link})

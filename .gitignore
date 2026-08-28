@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+
+# Virtual environment
+.venv/
+venv/
+
+# Editor / AI tooling
+.aider*
+
+# Runtime data (tokens, captures, campaign logs)
+data/captured_tokens.txt
+data/capture_*.log
+data/tokens.json
+output/
+
+# Secrets
+.env
+.egg-info/
+*.lnk

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alicit"
+version = "1.0.0"
+description = "AIlicit: AI-powered OAuth phishing & BEC post-exploitation research toolkit (authorized red-team use)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Endrit Shaqiri" }]
+dependencies = [
+    "requests>=2.31",
+    "aiohttp>=3.9",
+    "Flask>=3.0",
+    "Flask-SocketIO>=5.3",
+    "python-socketio>=5.10",
+    "feedparser>=6.0",
+    "langchain-openai>=0.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+alicit-recl   = "alicit.reclist:main"
+alicit-postexp = "alicit.postexp:main"
+alicit-dashboard = "alicit.dashboard:main"
+
+[tool.setuptools]
+packages = ["alicit"]

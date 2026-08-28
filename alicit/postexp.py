@@ -18,44 +18,36 @@ import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple, Optional
 
-# ------------------------------------------------------------------
-# CONFIGURATION (environment variables)
-# ------------------------------------------------------------------
-CLIENT_ID = "9aa62102-7d9a-45b0-91f3-e8965341dbc7"
-CLIENT_SECRET = "URR8Q~dc0CuHSf_GeV4V1547~tkXuQT1EE6apcKI"
-REDIRECT_URI = "https://a91c-128-197-28-178.ngrok-free.app/oauth/callback"
+from .constants import (
+    CLIENT_ID, CLIENT_SECRET, REDIRECT_URI,
+    GROQ_API_KEY, GROQ_ENDPOINT, SCOUT_MODEL, MAVERICK_MODEL,
+    TOKEN_FILE,
+)
 
-# Groq API (for Llama models)
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 if not GROQ_API_KEY:
     print("[!] GROQ_API_KEY environment variable not set.")
     sys.exit(1)
-
-GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
-SCOUT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-MAVERICK_MODEL = "llama-3.3-70b-versatile"
-
-TOKEN_FILE = "tokens.json"
 
 # ------------------------------------------------------------------
 # Token management
 # ------------------------------------------------------------------
 class TokenManager:
-    def __init__(self):
+    def __init__(self, token_file: str = TOKEN_FILE):
+        self.token_file = token_file
         self.access_token = None
         self.refresh_token = None
         self.expires_at = 0  # Unix timestamp
         self.load_from_file()
 
     def load_from_file(self):
-        if os.path.exists(TOKEN_FILE):
+        if os.path.exists(self.token_file):
             try:
-                with open(TOKEN_FILE, 'r') as f:
+                with open(self.token_file, 'r') as f:
                     data = json.load(f)
                     self.access_token = data.get('access_token')
                     self.refresh_token = data.get('refresh_token')
                     self.expires_at = data.get('expires_at', 0)
-                    print(f"[*] Loaded tokens from {TOKEN_FILE} (expires at {datetime.fromtimestamp(self.expires_at)})")
+                    print(f"[*] Loaded tokens from {self.token_file} (expires at {datetime.fromtimestamp(self.expires_at)})")
             except Exception as e:
                 print(f"[-] Failed to load tokens: {e}")
 
@@ -65,9 +57,9 @@ class TokenManager:
             'refresh_token': self.refresh_token,
             'expires_at': self.expires_at
         }
-        with open(TOKEN_FILE, 'w') as f:
+        with open(self.token_file, 'w') as f:
             json.dump(data, f, indent=2)
-        print(f"[*] Tokens saved to {TOKEN_FILE}")
+        print(f"[*] Tokens saved to {self.token_file}")
 
     def is_expired(self) -> bool:
         # Add 5-minute buffer

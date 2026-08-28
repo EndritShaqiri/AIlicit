@@ -20,8 +20,7 @@ import socket
 import feedparser
 import requests
 from urllib.parse import urlparse
-from langchain_community.llms import OpenAI
-from langchain_community.chat_models import ChatOpenAI
+from langchain_openai import OpenAI, ChatOpenAI
 from typing import List, Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
@@ -29,6 +28,8 @@ from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formatdate, make_msgid
+
+from .constants import REPO_ROOT
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -71,7 +72,7 @@ class Config:
     max_emails_per_domain: int = int(os.getenv("MAX_EMAILS_PER_DOMAIN", "50"))
     
     # Output
-    output_dir: str = os.getenv("OUTPUT_DIR", "./output")
+    output_dir: str = os.getenv("OUTPUT_DIR", os.path.join(REPO_ROOT, "output"))
 
 # ============================================================
 # STEALTH NETWORKING
