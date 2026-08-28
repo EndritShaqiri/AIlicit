@@ -10,6 +10,12 @@ Purpose: Authorized red team security assessment tool
 import os
 import sys
 import json
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 import time
 import random
 import logging
@@ -29,7 +35,10 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formatdate, make_msgid
 
-from .constants import REPO_ROOT
+try:
+    from .constants import REPO_ROOT
+except ImportError:
+    from constants import REPO_ROOT
 
 import requests
 from requests.adapters import HTTPAdapter
