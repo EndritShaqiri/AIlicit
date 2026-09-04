@@ -33,6 +33,21 @@ SCOUT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 MAVERICK_MODEL = "llama-3.3-70b-versatile"
 
 # ------------------------------------------------------------------
+# Foundation-Sec-8B (reasoning / path-selection analyst).
+# Optional layer - if not configured, Groq Llama-3.3-70b is used as
+# the fallback selector, and if that is also missing the agent falls
+# back to a purely deterministic (score-based) selection.
+# Expects an OpenAI-compatible endpoint (Ollama by default).
+# ------------------------------------------------------------------
+SEC_API_KEY = os.getenv("SEC_API_KEY", "")
+SEC_BASE_URL = os.getenv("SEC_BASE_URL", "http://localhost:11434/v1")
+SEC_MODEL = os.getenv("SEC_MODEL", "foundation-sec-8b")
+
+# External address used as the forwarding target when auto-executing a
+# mail-forwarding persistence path. Override for your lab.
+PRIVESC_CAPTURE_EMAIL = os.getenv("PRIVESC_CAPTURE_EMAIL", "attacker@demo.com")
+
+# ------------------------------------------------------------------
 # Default data file locations
 # ------------------------------------------------------------------
 TOKEN_FILE = os.getenv("TOKEN_FILE", os.path.join(DATA_DIR, "tokens.json"))

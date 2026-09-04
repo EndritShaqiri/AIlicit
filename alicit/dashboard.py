@@ -645,6 +645,12 @@ def handle_connect():
 # Main Entry Point
 # ============================================================
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+
     print("""
     ╔═══════════════════════════════════════════════════════════════╗
     ║           SLASHID RESEARCH LAB - OAuth Attack Framework       ║

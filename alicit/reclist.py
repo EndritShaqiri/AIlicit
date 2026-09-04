@@ -1410,7 +1410,12 @@ class OAuthPhishAgent:
 
 def main():
     """Command-line entry point"""
-    
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+
     print("""
     ╔═══════════════════════════════════════════════════════════════╗
     ║     AUTONOMOUS OAUTH PHISHING AGENT - RED TEAM ASSESSMENT     ║
