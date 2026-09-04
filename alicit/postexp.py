@@ -23,6 +23,7 @@ from .constants import (
     GROQ_API_KEY, GROQ_ENDPOINT, SCOUT_MODEL, MAVERICK_MODEL,
     TOKEN_FILE,
 )
+from .privesc import run_privesc
 
 if not GROQ_API_KEY:
     print("[!] GROQ_API_KEY environment variable not set.")
@@ -378,6 +379,17 @@ def interactive_menu(token_mgr: TokenManager):
             print(f"[+] Contacts: {len(recon.get('contacts', {}).get('value', []))}")
             print(f"[+] Events: {len(recon.get('events', {}).get('value', []))}")
             print(f"[+] Direct reports: {len(recon.get('direct_reports', {}).get('value', []))}")
+
+            # Privesc engine: M365 escalation graph + Foundation-Sec-8B top-3 selection
+            print("\n[Phase 2B] Privilege escalation analysis (M365 graph + Foundation-Sec-8B)...")
+            privesc_result = run_privesc(token_mgr, recon)
+            print(f"[+] Candidate paths found: {privesc_result.get('total_candidate_paths', 0)}")
+            if privesc_result.get("status") == "success":
+                for i, p in enumerate(privesc_result.get("top_3_paths", []), 1):
+                    print(f"  [{i}] {p['name']} - PRIVESC probability: {p['probability_percent']}%")
+                    print(f"      Impact: {p['impact']}")
+            else:
+                print(f"[-] Privesc analysis: {privesc_result.get('reason', 'failed')}")
 
             summary, vulnerable = llamascout_analyse(token_mgr)
             print("\n[Llama‑4‑Scout Analysis Summary]")
