@@ -6,6 +6,13 @@ Runtime data files live in the repository's ``data/`` directory.
 
 import os
 
+# Load .env from the repo root if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+except ImportError:
+    pass
+
 # ------------------------------------------------------------------
 # Repository layout (data files live outside the package)
 # ------------------------------------------------------------------
@@ -17,11 +24,17 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # ------------------------------------------------------------------
 # Microsoft OAuth app (malicious OAuth app used for the attack chain)
 # ------------------------------------------------------------------
-CLIENT_ID = os.getenv("OAUTH_CLIENT_ID", "9aa62102-7d9a-45b0-91f3-e8965341dbc7")
-CLIENT_SECRET = os.getenv("OAUTH_CLIENT_SECRET", "URR8Q~dc0CuHSf_GeV4V1547~tkXuQT1EE6apcKI")
+CLIENT_ID = os.getenv("OAUTH_CLIENT_ID", "756b1e2d-0cd5-4ada-8bcc-a415b949216e")
+CLIENT_SECRET = os.getenv("OAUTH_CLIENT_SECRET", "")
 REDIRECT_URI = os.getenv(
     "OAUTH_REDIRECT_URI",
-    "https://a91c-128-197-28-178.ngrok-free.app/oauth/callback",
+    "https://f8e7-2601-19b-d86-32d0-dc82-3e12-1027-d696.ngrok-free.app/oauth/callback",
+)
+
+# OAuth scopes requested in the authorization URL (consent screen)
+OAUTH_SCOPES = os.getenv(
+    "OAUTH_SCOPES",
+    "offline_access User.Read Mail.ReadWrite Mail.Send Files.ReadWrite Contacts.ReadWrite Calendars.ReadWrite",
 )
 
 # ------------------------------------------------------------------
@@ -29,8 +42,11 @@ REDIRECT_URI = os.getenv(
 # ------------------------------------------------------------------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
-SCOUT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-MAVERICK_MODEL = "llama-3.3-70b-versatile"
+SCOUT_MODEL = "openai/gpt-oss-20b"        # For financial exposure analysis
+
+ORCAROUTER_MODEL = "deepseek/deepseek-v4-flash-free"
+ORCAROUTER_ENDPOINT = "https://api.orcarouter.ai/v1/chat/completions"
+ORCAROUTER_API_KEY = os.getenv("ORCAROUTER_API_KEY", "")
 
 # ------------------------------------------------------------------
 # Foundation-Sec-8B (reasoning / path-selection analyst).
@@ -40,8 +56,8 @@ MAVERICK_MODEL = "llama-3.3-70b-versatile"
 # Expects an OpenAI-compatible endpoint (Ollama by default).
 # ------------------------------------------------------------------
 SEC_API_KEY = os.getenv("SEC_API_KEY", "")
-SEC_BASE_URL = os.getenv("SEC_BASE_URL", "http://localhost:11434/v1")
-SEC_MODEL = os.getenv("SEC_MODEL", "foundation-sec-8b")
+SEC_BASE_URL = "http://localhost:8080/v1"  # Or whatever port llama.cpp uses
+SEC_MODEL = "Foundation-Sec-8B"
 
 # External address used as the forwarding target when auto-executing a
 # mail-forwarding persistence path. Override for your lab.

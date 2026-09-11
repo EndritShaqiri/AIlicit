@@ -57,4 +57,4 @@ def ping():
 
 if __name__ == '__main__':
     # For local testing only — use gunicorn + nginx for production
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    app.run(host='0.0.0.0', port=8081, debug=False)

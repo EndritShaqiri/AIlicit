@@ -24,3 +24,9 @@ output/
 .env
 .egg-info/
 *.lnk
+
+# Secrets / env
+.env
+data/captured_tokens.txt
+data/capture_*.log
+data/tokens.json
