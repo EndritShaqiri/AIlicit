@@ -34,7 +34,7 @@ REDIRECT_URI = os.getenv(
 # OAuth scopes requested in the authorization URL (consent screen)
 OAUTH_SCOPES = os.getenv(
     "OAUTH_SCOPES",
-    "offline_access User.Read Mail.ReadWrite Mail.Send Files.ReadWrite Contacts.ReadWrite Calendars.ReadWrite",
+    "offline_access User.Read Mail.ReadWrite Mail.Send Files.ReadWrite Contacts.ReadWrite Calendars.ReadWrite Directory.Read.All",
 )
 
 # ------------------------------------------------------------------
@@ -52,12 +52,14 @@ ORCAROUTER_API_KEY = os.getenv("ORCAROUTER_API_KEY", "")
 # Foundation-Sec-8B (reasoning / path-selection analyst).
 # Optional layer - if not configured, Groq Llama-3.3-70b is used as
 # the fallback selector, and if that is also missing the agent falls
-# back to a purely deterministic (score-based) selection.
-# Expects an OpenAI-compatible endpoint (Ollama by default).
+# back to a purely deterministic (score-based) selection).
+# Expects an OpenAI-compatible endpoint (local Ollama on 11434;
+# override with QWEN_BASE_URL, e.g. http://localhost:8080/v1 if you
+# front it with llama.cpp. The OAuth capture listener uses 8081).
 # ------------------------------------------------------------------
-SEC_API_KEY = os.getenv("SEC_API_KEY", "")
-SEC_BASE_URL = "http://localhost:8080/v1"  # Or whatever port llama.cpp uses
-SEC_MODEL = "Foundation-Sec-8B"
+QWEN_API_KEY = os.getenv("QWEN_API_KEY", "ollama")
+QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:11434/v1")
+QWEN_MODEL = os.getenv("QWEN_MODEL", "hf.co/fdtn-ai/Foundation-Sec-1.1-8B-Instruct-Q8_0-GGUF:Q8_0")
 
 # External address used as the forwarding target when auto-executing a
 # mail-forwarding persistence path. Override for your lab.

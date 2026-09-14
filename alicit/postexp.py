@@ -377,8 +377,8 @@ def interactive_menu(token_mgr: TokenManager):
         print("="*50)
         print("1. Refresh access token")
         print("2. Run BEC reconnaissance + crafting (top 2 threads)")
-        print("3. Run privilege-escalation analysis (deep, Foundation-Sec-8B)")
-        print("4. Run freestyle privesc hunt (Foundation-Sec-8B explores tenant)")
+        print("3. Run privilege-escalation analysis (deep, Qwen3.8-27B-Uncensored)")
+        print("4. Run freestyle privesc hunt (Qwen3.8-27B-Uncensored explores tenant)")
         print("5. Send BEC for a specific thread (by index)")
         print("6. Show last recon summary")
         print("7. List vulnerable threads (if recon done)")
@@ -434,10 +434,10 @@ def interactive_menu(token_mgr: TokenManager):
                     subject = f"RE: {vt['subject']}"
                     send_email(token_mgr, to_email, subject, email_body)
         elif choice == '3':
-            # Deep privilege-escalation analysis (M365 graph + Foundation-Sec-8B)
+            # Deep privilege-escalation analysis (M365 graph + Qwen3.8-27B-Uncensored)
             print("\n[*] Starting deep privilege-escalation reconnaissance...")
             recon = asyncio.run(parallel_recon(token_mgr))
-            print("\n[Phase 2B] Privilege escalation analysis (deep inspection: apps, SPs, roles, misconfigs + Foundation-Sec-8B)...")
+            print("\n[Phase 2B] Privilege escalation analysis (deep inspection: apps, SPs, roles, misconfigs + Qwen3.8-27B-Uncensored)...")
             privesc_result = run_privesc(token_mgr, recon)
             print(f"[+] Candidate paths found: {privesc_result.get('total_candidate_paths', 0)}")
             if privesc_result.get("status") == "success":
@@ -453,8 +453,8 @@ def interactive_menu(token_mgr: TokenManager):
             else:
                 print(f"[-] Privesc analysis: {privesc_result.get('reason', 'failed')}")
         elif choice == '4':
-            # Freestyle Foundation-Sec-8B privesc hunt
-            print("\n[Phase 2C] Freestyle privilege-escalation hunt (Foundation-Sec-8B freely explores tenant)...")
+            # Freestyle Qwen3.8-27B-Uncensored privesc hunt
+            print("\n[Phase 2C] Freestyle privilege-escalation hunt (Qwen3.8-27B-Uncensored freely explores tenant)...")
             fs_result = run_privesc_freestyle(token_mgr)
             if fs_result.get("status") == "success":
                 print(f"[+] Queries explored: {len(fs_result.get('queries_explored', []))}")

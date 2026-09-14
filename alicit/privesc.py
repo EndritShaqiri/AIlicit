@@ -5,8 +5,8 @@ privesc.py - M365 Privilege Escalation Engine
 Three-layer architecture:
 1. Deterministic permission graph (edge table + recon data)
    -> Edge expansion produces all candidate escalation paths (JSON).
-2. Foundation-Sec-8B reasoning layer (OpenAI-compatible / Ollama endpoint).
-   Fallback chain: Foundation-Sec-8B -> Groq Llama-3.3-70b -> deterministic
+2. Qwen3.8-27B-Uncensored reasoning layer (OpenAI-compatible / Ollama endpoint).
+   Fallback chain: Qwen3.8-27B-Uncensored -> Groq Llama-3.3-70b -> deterministic
    score-based selection.
 3. Top-3 path ranking with PRIVESC probability percentages.
 
@@ -14,7 +14,7 @@ Pipeline:
     Recon Data (OAuth scopes + parallel_recon results)
         -> Graph Engine (Edge Expansion)
         -> Candidate Paths (JSON)
-        -> Foundation-Sec-8B (Path Selection + Reasoning)
+        -> Qwen3.8-27B-Uncensored (Path Selection + Reasoning)
         -> Top 3 Selected Paths with PRIVESC probability (JSON)
 
 Integration with postexp.py:
@@ -38,7 +38,7 @@ from datetime import datetime
 import requests
 
 from .constants import (
-    SEC_API_KEY, SEC_BASE_URL, SEC_MODEL,
+    QWEN_API_KEY, QWEN_BASE_URL, QWEN_MODEL,
     GROQ_API_KEY, GROQ_ENDPOINT, SCOUT_MODEL,
     CLIENT_ID, CLIENT_SECRET,
 )
@@ -704,17 +704,17 @@ class EdgeExpander:
 # FOUNDATION-SEC-8B REASONING LAYER
 # ============================================================
 
-class Sec8BReasoner:
+class QwenReasoner:
     """Path-selection reasoning layer.
 
-    Foundation-Sec-8B is the PRIMARY and always-attempted backend (with
+    Qwen3.8-27B-Uncensored is the PRIMARY and always-attempted backend (with
     retries). Groq (GPT-oss-20b) is a secondary fallback; deterministic
     score-based selection is only used as an absolute last resort when
     neither model is reachable or parseable.
     """
 
     SYSTEM_PROMPT = (
-        "You are Foundation-Sec-8B, a senior Microsoft 365 / Entra ID red-team analyst. "
+        "You are Qwen3.8-27B-Uncensored, a senior Microsoft 365 / Entra ID red-team analyst. "
         "You are given deterministic privilege-escalation candidate paths plus recon context. "
         "Select the TOP 3 most probable privilege-escalation paths for THIS tenant, assign each "
         "a probability percentage, and explain your reasoning.\n"
@@ -723,13 +723,13 @@ class Sec8BReasoner:
         "high-privilege app roles (Directory.ReadWrite.All / User.ReadWrite.All), direct "
         "privileged role assignments (Global Admin, Privileged Role Admin), user-owned "
         "service principals, and guest invitations. Prefer the path with the highest "
-        "(probability x impact) that is also stealthy and reversible where possible."
-    )
+        "(probability x impact) that is also stealthy and reversible where possible.\n"
+        "<|no_think|>"    )
 
     MAX_RETRIES = 3
 
     def __init__(self):
-        self.sec_url = (SEC_BASE_URL or "").rstrip("/") + "/chat/completions"
+        self.qwen_url = (QWEN_BASE_URL or "").rstrip("/") + "/chat/completions"
 
     # ----------------------------------------------------------
     def select_paths(self, edges: List[EscalationEdge], recon_data: ReconData) -> List[RankedPath]:
@@ -744,16 +744,16 @@ class Sec8BReasoner:
         candidates = self._build_candidates(edges, recon_data)
         prompt = self._build_prompt(candidates, recon_data)
 
-        response = self._call_sec8b(prompt) or self._call_groq(prompt)
+        response = self._call_qwen(prompt) or self._call_groq(prompt)
         if not response:
             logger.warning(
-                "[Sec-8B] model unreachable after retries - using deterministic selection"
+                "[Qwen] model unreachable after retries - using deterministic selection"
             )
             return deterministic
 
         parsed = self._parse_response(response, edges)
         if not parsed:
-            logger.warning("[Sec-8B] response unparseable - using deterministic selection")
+            logger.warning("[Qwen] response unparseable - using deterministic selection")
             return deterministic
 
         # Keep only paths grounded in the deterministic edge set
@@ -771,7 +771,7 @@ class Sec8BReasoner:
                 else:
                     continue
             if p.path_id in deterministic_map:
-                p.source = "foundation-sec-8b"
+                p.source = "qwen-27b"
                 grounded.append(p)
 
         if not grounded:
@@ -833,22 +833,26 @@ class Sec8BReasoner:
         )
 
     # ----------------------------------------------------------
-    def _call_sec8b(self, prompt: str) -> Optional[str]:
-        """Call Foundation-Sec-8B (always the primary model) with retries."""
-        if not (SEC_API_KEY or SEC_BASE_URL):
-            logger.warning("[Sec-8B] SEC_BASE_URL/SEC_API_KEY not configured")
+    def _call_qwen(self, prompt: str) -> Optional[str]:
+        """Call Qwen3.8-27B-Uncensored (always the primary model) with retries."""
+        if not (QWEN_API_KEY or QWEN_BASE_URL):
+            logger.warning("[Qwen] QWEN_BASE_URL/QWEN_API_KEY not configured")
             return None
         headers = {"Content-Type": "application/json"}
-        if SEC_API_KEY:
-            headers["Authorization"] = f"Bearer {SEC_API_KEY}"
+        if QWEN_API_KEY:
+            headers["Authorization"] = f"Bearer {QWEN_API_KEY}"
         payload = {
-            "model": SEC_MODEL,
+            "model": QWEN_MODEL,
             "messages": [
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
             "max_tokens": 2200,
+            # Disable the Qwen3 hybrid "thinking" mode: by default the model
+            # spends its tokens on an internal reasoning field and returns
+            # empty `content`. Ignored by non-Ollama OpenAI-compatible servers.
+            "think": False,
             # llama.cpp sampling extras (ignored by OpenAI-compatible servers)
             "repetition_penalty": 1.2,
             "min_p": 0.05,
@@ -857,16 +861,16 @@ class Sec8BReasoner:
         last_err = None
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
-                resp = requests.post(self.sec_url, json=payload, headers=headers, timeout=120)
+                resp = requests.post(self.qwen_url, json=payload, headers=headers, timeout=300)
                 if resp.status_code != 200:
                     last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                    logger.info("[Sec-8B] attempt %d/%d %s", attempt, self.MAX_RETRIES, last_err)
+                    logger.info("[Qwen] attempt %d/%d %s", attempt, self.MAX_RETRIES, last_err)
                     continue
                 content = resp.json()["choices"][0]["message"]["content"]
                 # Corrective retry: if the model chatted instead of returning JSON,
                 # feed it back and demand a strict JSON object.
                 if attempt < self.MAX_RETRIES and not _extract_json(content):
-                    logger.info("[Sec-8B] attempt %d/%d returned non-JSON; nudging: %r",
+                    logger.info("[Qwen] attempt %d/%d returned non-JSON; nudging: %r",
                                 attempt, self.MAX_RETRIES, content[:120])
                     messages.append({"role": "assistant", "content": content})
                     messages.append({"role": "user", "content":
@@ -877,8 +881,8 @@ class Sec8BReasoner:
                 return content
             except Exception as e:
                 last_err = str(e)
-                logger.info("[Sec-8B] attempt %d/%d failed: %s", attempt, self.MAX_RETRIES, e)
-        logger.warning("[Sec-8B] unavailable after %d attempts (%s)", self.MAX_RETRIES, last_err)
+                logger.info("[Qwen] attempt %d/%d failed: %s", attempt, self.MAX_RETRIES, e)
+        logger.warning("[Qwen] unavailable after %d attempts (%s)", self.MAX_RETRIES, last_err)
         return None
 
     def _call_groq(self, prompt: str) -> Optional[str]:
@@ -908,10 +912,10 @@ class Sec8BReasoner:
     # ----------------------------------------------------------
     def _parse_response(self, response: str, edges: List[EscalationEdge]) -> List[RankedPath]:
         """Robustly parse model JSON into RankedPath objects (may be partial)."""
-        logger.debug("[Sec-8B] raw response (first 500 chars): %r", (response or "")[:500])
+        logger.debug("[Qwen] raw response (first 500 chars): %r", (response or "")[:500])
         data = _extract_json(response)
         if not data:
-            logger.warning("[Sec-8B] could not extract JSON from model output")
+            logger.warning("[Qwen] could not extract JSON from model output")
             return []
 
         edge_map = {e.path_id: e for e in edges}
@@ -941,7 +945,7 @@ class Sec8BReasoner:
                 time_estimate=item.get("time_estimate", "2-5 minutes"),
                 narrative=item.get("narrative") or edge.description,
                 reasoning=item.get("reasoning") or "Selected by AI reasoning layer.",
-                source="foundation-sec-8b",
+                source="qwen-27b",
             ))
         return out
 
@@ -990,11 +994,11 @@ class Sec8BReasoner:
 # FREESTYLE FOUNDATION-SEC-8B PRIVESC EXPLORER
 # ============================================================
 
-class Sec8BExplorer:
+class QwenExplorer:
     """Freestyle, non-deterministic privilege-escalation hunter.
 
-    Unlike Sec8BReasoner (which ranks a fixed deterministic edge table),
-    this class gives Foundation-Sec-8B a small Graph query tool and lets it
+    Unlike QwenReasoner (which ranks a fixed deterministic edge table),
+    this class gives the model a small Graph query tool and lets it
     FREELY explore the tenant for escalation routes it discovers on its own.
     The model drives up to MAX_TURNS tool calls; each turn it may issue one
     Microsoft Graph GET (whitelisted prefixes, $top capped) and receive the
@@ -1005,8 +1009,8 @@ class Sec8BExplorer:
     """
 
     SYSTEM_PROMPT = (
-        "You are Foundation-Sec-8B, an autonomous Microsoft 365 / Entra ID "
-        "red-team agent performing FREE privilege-escalation reconnaissance. "
+        "You are an autonomous Microsoft 365 / Entra ID red-team agent "
+        "performing FREE privilege-escalation reconnaissance. "
         "You are NOT limited to any preset list of attack paths: explore the tenant "
         "freely - privileged roles, group ownership, service principals, enterprise "
         "application app roles, app role assignments, guest users, mail rules, "
@@ -1014,20 +1018,33 @@ class Sec8BExplorer:
         "that could lead to higher privilege.\n"
         "Each turn you may do ONE of:\n"
         '1) Query the tenant: respond with {"action": "query", "endpoint": "/...", "why": "..."}\n'
-        '2) Finish: respond with {"action": "finish", "paths": [ {"name": "...", '
-        '"description": "...", "steps": ["...", "..."], "probability": 0.0-1.0, '
-        '"evidence": "..."} ]}\n'
-        'Rules: '
-        'ONLY respond with a single JSON object - no prose, no explanation, no markdown. '
-        'The first character of your response must be { and the last must be }. '
-        'Only Microsoft Graph v1 GET endpoints (start with /), no spaces in the endpoint, '
-        'keep $top <= 50, at most 4-5 queries before finishing. '
-        'Every query must be DIFFERENT from the previous one. '
-        'If a query returns an error, try a different endpoint immediately. '
-        'Do NOT repeat the same text. Do NOT narrate. Just JSON.'
+        "2) Finish: respond with "
+        '{"action": "finish", "paths": [{"name": "...", "description": "...", '
+        '"steps": ["...", "..."], "probability": 0.0-1.0, "evidence": "..."}]}\n'
+        "Finish rules — read carefully:\n"
+        '   - "name" is a SHORT concrete title (e.g. "SP AppRole PrivEsc via Owned Object") '
+        "— REQUIRED, never empty or generic.\n"
+        '   - "description" describes what you FOUND in the results, not what to look for next.\n'
+        '   - "evidence" MUST quote or reference specific values from RESULT blocks '
+        "(object IDs, role names, counts, display names). "
+        "Generic statements like 'further analysis required' are not evidence.\n"
+        '   - "probability" reflects confidence based ONLY on data already returned. '
+        "NEVER return a path with probability 0.0 — omit it entirely instead.\n"
+        "   - Do NOT use language like 'check if', 'review', 'could', 'may', 'might' "
+        "— describe actual findings, not suggestions for future work.\n"
+        "   - An empty paths list is valid and strongly preferred over zero-evidence "
+        "or speculative paths.\n"
+        "Query rules:\n"
+        "- ONLY respond with a single JSON object - no prose, no explanation, no markdown.\n"
+        "- The first character of your response must be { and the last must be }.\n"
+        "- Only Microsoft Graph v1 GET endpoints (start with /), no spaces in the endpoint.\n"
+        "- Keep $top <= 50. Every query must be DIFFERENT from all previous ones.\n"
+        "- If a query returns an error, try a different endpoint immediately.\n"
+        "- Do NOT repeat the same text. Do NOT narrate. Just JSON.\n"
     )
 
     MAX_TURNS = 8
+    MAX_CONSECUTIVE_REPEATS = 2
     MAX_TOP = 50
     ALLOWED_PREFIXES = (
         "/me", "/users", "/groups", "/servicePrincipals", "/applications",
@@ -1037,94 +1054,212 @@ class Sec8BExplorer:
 
     def __init__(self, token_mgr):
         self.token_mgr = token_mgr
-        self.sec_url = (SEC_BASE_URL or "").rstrip("/") + "/chat/completions"
+        self.qwen_url = (QWEN_BASE_URL or "").rstrip("/") + "/chat/completions"
         self.queries_made: List[str] = []
-        self._seen: List[str] = []  # recent raw outputs (repetition guard)
 
     # ----------------------------------------------------------
     def explore(self) -> List[Dict[str, Any]]:
         """Run the conversational exploration loop; return discovered paths."""
-        if not (SEC_API_KEY or SEC_BASE_URL):
-            logger.warning("[Explorer] SEC_BASE_URL/SEC_API_KEY not configured")
+        if not (QWEN_API_KEY or QWEN_BASE_URL):
+            logger.warning("[Explorer] QWEN_BASE_URL/QWEN_API_KEY not configured")
             return []
 
         seed = (
             "Find privilege escalation routes in this tenant. "
             "Suggested first endpoints: /me, /me/roleAssignments, /me/memberOf, "
             "/servicePrincipals?$top=20. "
-            'Respond NOW with your first JSON object: {"action": "query", ' '"endpoint": "/...", "why": "..."}'
+            f"You have {self.MAX_TURNS} turns total. "
+            "Plan to query for the first 5-6 turns, then synthesise and finish. "
+            'Respond NOW with your first JSON object: {"action": "query", "endpoint": "/...", "why": "..."}'
         )
         messages = [
             {"role": "system", "content": self.SYSTEM_PROMPT},
             {"role": "user", "content": seed},
         ]
-        headers = {"Content-Type": "application/json"}
-        if SEC_API_KEY:
-            headers["Authorization"] = f"Bearer {SEC_API_KEY}"
+
+        consecutive_repeats = 0
+        last_endpoint: Optional[str] = None
 
         for turn in range(1, self.MAX_TURNS + 1):
+            turns_remaining = self.MAX_TURNS - turn
+            temperature = min(0.3 + 0.2 * consecutive_repeats, 1.0)
+
+            # ── Mandatory finish on last turn ──────────────────────────
+            if turns_remaining == 0:
+                logger.info("[Explorer] final turn — injecting mandatory finish prompt")
+                already = ", ".join(self.queries_made)
+                messages.append({"role": "user", "content":
+                    "This is your FINAL turn. No more queries are allowed. "
+                    f"You queried: [{already}]. "
+                    "Look at ALL RESULT blocks above and synthesise every escalation path "
+                    "those results directly evidence. Do NOT speculate or suggest further queries. "
+                    "Low-probability paths count. An empty paths list is valid if nothing was found. "
+                    'You MUST respond with {"action": "finish", "paths": [...]} — '
+                    "no queries allowed."})
+
             try:
-                resp = requests.post(self.sec_url, json={
-                    "model": SEC_MODEL,
+                resp = requests.post(self.qwen_url, json={
+                    "model": QWEN_MODEL,
                     "messages": messages,
-                    "temperature": 0.3,
-                    "max_tokens": 1500,
-                    "repetition_penalty": 1.3,   # llama.cpp: breaks echo loops
+                    "temperature": 0.1 if turns_remaining == 0 else temperature,
+                    "max_tokens": 3000 if turns_remaining == 0 else 1500,
+                    "think": False,
+                    "repetition_penalty": 1.3,
                     "min_p": 0.05,
-                }, headers=headers, timeout=120)
+                }, headers=self._make_headers(), timeout=300)
+
                 if resp.status_code != 200:
                     logger.warning("[Explorer] HTTP %s: %s", resp.status_code, resp.text[:200])
                     break
                 content = resp.json()["choices"][0]["message"]["content"]
+
             except Exception as e:
                 logger.warning("[Explorer] model call failed (turn %d): %s", turn, e)
                 break
 
             decision = self._parse_decision(content)
+
+            # ── Unparseable output ─────────────────────────────────────
             if not decision:
-                logger.info("[Explorer] unparseable model output (turn %d): %s", turn, content[:200])
-                # Nudge the model instead of aborting entirely
+                logger.info("[Explorer] unparseable output (turn %d): %s", turn, content[:200])
                 messages.append({"role": "assistant", "content": content})
                 messages.append({"role": "user", "content":
-                    'Your last response was not valid JSON. Respond with ONLY one JSON object: '
+                    'Invalid JSON. Respond ONLY with one JSON object: '
                     '{"action": "query", "endpoint": "/...", "why": "..."} or '
                     '{"action": "finish", "paths": [...]}. No prose.'})
-                continue
-
-            # Repetition guard: identical output 2x in a row -> nudge
-            norm = content.strip()[:200]
-            self._seen.append(norm)
-            if len(self._seen) >= 2 and self._seen[-1] == self._seen[-2]:
-                logger.warning("[Explorer] repeated output detected (turn %d)", turn)
-                messages.append({"role": "assistant", "content": content})
-                messages.append({"role": "user", "content":
-                    'You repeated the same response. Issue a DIFFERENT query now, or finish.'})
+                consecutive_repeats += 1
                 continue
 
             action = decision.get("action")
+
+            # ── Finish ─────────────────────────────────────────────────
             if action == "finish":
                 paths = decision.get("paths") or []
                 for p in paths:
                     p["source"] = "sec8b_freestyle"
                     p["queries_explored"] = self.queries_made[:]
-                logger.info("[Explorer] finished after %d queries", len(self.queries_made))
+                logger.info("[Explorer] finished after %d queries, %d paths found",
+                            len(self.queries_made), len(paths))
                 return paths
 
+            # ── Query ──────────────────────────────────────────────────
             if action == "query":
+
+                # Model ignored mandatory finish prompt — force synthesis
+                if turns_remaining == 0:
+                    logger.warning("[Explorer] model queried on final turn — forcing synthesis")
+                    return self._force_synthesis(messages)
+
                 endpoint = str(decision.get("endpoint", "")).strip()
+
+                # Parsed-endpoint repeat detection
+                if endpoint == last_endpoint:
+                    consecutive_repeats += 1
+                    logger.warning("[Explorer] repeated endpoint %r (turn %d, repeat #%d)",
+                                   endpoint, turn, consecutive_repeats)
+
+                    if consecutive_repeats >= self.MAX_CONSECUTIVE_REPEATS:
+                        logger.warning("[Explorer] %d consecutive repeats — forcing synthesis",
+                                       consecutive_repeats)
+                        return self._force_synthesis(messages)
+
+                    already = ", ".join(self.queries_made)
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({"role": "user", "content":
+                        f"You already queried {endpoint!r}. "
+                        f"Queried so far: [{already}]. "
+                        f"Issue a DIFFERENT endpoint or finish. "
+                        f"{turns_remaining} turns remaining."})
+                    continue
+
+                # Valid new query
+                consecutive_repeats = 0
+                last_endpoint = endpoint
                 result = self._safe_graph_get(endpoint)
                 self.queries_made.append(endpoint)
-                # Append assistant + user messages, truncating large responses
                 snippet = json.dumps(result)[:4000]
+
+                if turns_remaining <= 3:
+                    budget_msg = (
+                        f"{turns_remaining - 1} turns remaining after this — "
+                        "start wrapping up and prepare to finish."
+                    )
+                else:
+                    budget_msg = f"{turns_remaining - 1} turns remaining."
+
                 messages.append({"role": "assistant", "content": content})
-                messages.append({"role": "user", "content": f"RESULT for {endpoint}: {snippet}"})
+                messages.append({"role": "user", "content":
+                    f"RESULT for {endpoint}: {snippet}\n"
+                    f"Queried so far: [{', '.join(self.queries_made)}]. "
+                    f"Do NOT re-query any of those. {budget_msg}"})
                 continue
 
-            logger.info("[Explorer] unknown action %r - stopping", action)
+            logger.info("[Explorer] unknown action %r — stopping", action)
             break
 
-        logger.info("[Explorer] reached max turns with no finish; returning paths found so far: none")
-        return []
+        logger.info("[Explorer] loop exited without finish — forcing synthesis")
+        return self._force_synthesis(messages)
+
+    # ----------------------------------------------------------
+    def _force_synthesis(self, messages: List[Dict]) -> List[Dict[str, Any]]:
+        """
+        Last-resort synthesis call.
+        Sends the full conversation back and demands a finish response.
+        Called when the model exhausts turns, ignores the final-turn prompt,
+        or gets stuck in a repeat loop.
+        """
+        logger.info("[Explorer] _force_synthesis: issuing mandatory finish call")
+        already = ", ".join(self.queries_made)
+        synthesis_messages = messages + [{
+            "role": "user",
+            "content":
+                "STOP. You must finish NOW. No more queries allowed. "
+                f"You queried: [{already}]. "
+                "Review ALL RESULT blocks above and synthesise ONLY escalation paths "
+                "directly evidenced by that data — privileged roles, group ownerships, "
+                "app role assignments, misconfigured service principals, anything concrete. "
+                "Do NOT speculate. Do NOT suggest further queries. "
+                "If the results show no escalation surface, return an empty paths list. "
+                'Respond ONLY with: {"action": "finish", "paths": [...]}.'
+        }]
+        try:
+            resp = requests.post(self.qwen_url, json={
+                "model": QWEN_MODEL,
+                "messages": synthesis_messages,
+                "temperature": 0.1,
+                "max_tokens": 3000,
+                "think": False,
+                "repetition_penalty": 1.0,
+            }, headers=self._make_headers(), timeout=300)
+
+            if resp.status_code != 200:
+                logger.warning("[Explorer] _force_synthesis HTTP %s", resp.status_code)
+                return []
+
+            content = resp.json()["choices"][0]["message"]["content"]
+            decision = self._parse_decision(content)
+
+            if decision and decision.get("action") == "finish":
+                paths = decision.get("paths") or []
+                for p in paths:
+                    p["source"] = "sec8b_freestyle_forced"
+                    p["queries_explored"] = self.queries_made[:]
+                logger.info("[Explorer] _force_synthesis recovered %d paths", len(paths))
+                return paths
+
+            logger.warning("[Explorer] _force_synthesis: model still did not finish — giving up")
+            return []
+
+        except Exception as e:
+            logger.warning("[Explorer] _force_synthesis failed: %s", e)
+            return []
+
+    # ----------------------------------------------------------
+    def _make_headers(self) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if QWEN_API_KEY:
+            headers["Authorization"] = f"Bearer {QWEN_API_KEY}"
+        return headers
 
     # ----------------------------------------------------------
     def _safe_graph_get(self, endpoint: str) -> Any:
@@ -1144,7 +1279,6 @@ class Sec8BExplorer:
         ep = path + ("?" + "&".join(params) if params else "")
         try:
             data = _graph_get(self.token_mgr, ep, timeout=30)
-            # Truncate list values to MAX_TOP entries
             if isinstance(data, dict) and isinstance(data.get("value"), list):
                 data = dict(data)
                 data["value"] = data["value"][: self.MAX_TOP]
@@ -1158,13 +1292,12 @@ class Sec8BExplorer:
         """Extract a JSON object from model output using the shared robust parser."""
         return _extract_json(content)
 
-
 # ============================================================
 # MAIN ORCHESTRATOR
 # ============================================================
 
 class PrivilegeEscalationEngine:
-    """Orchestrates: recon -> edge expansion -> Sec-8B selection -> top 3 JSON."""
+    """Orchestrates: recon -> edge expansion -> Qwen selection -> top 3 JSON."""
 
     def __init__(self, token_mgr=None):
         self.token_mgr = token_mgr
@@ -1357,9 +1490,9 @@ class PrivilegeEscalationEngine:
                 "top_3_paths": [],
             }
 
-        # Phase 3: Foundation-Sec-8B selection (with fallbacks)
-        logger.info("[PHASE 3] PATH SELECTION (Foundation-Sec-8B)")
-        reasoner = Sec8BReasoner()
+        # Phase 3: Qwen3.8-27B-Uncensored selection (with fallbacks)
+        logger.info("[PHASE 3] PATH SELECTION (Qwen3.8-27B-Uncensored)")
+        reasoner = QwenReasoner()
         self.ranked_paths = reasoner.select_paths(self.edges, self.recon_data)
         logger.info("[+] Top %d paths selected (source: %s)",
                     len(self.ranked_paths),
@@ -1380,7 +1513,7 @@ class PrivilegeEscalationEngine:
 
         return {
             "status": "success",
-            "engine": "deterministic-m365-graph + foundation-sec-8b",
+            "engine": "deterministic-m365-graph + qwen-27b",
             "recon": {
                 "granted_scopes": self.recon_data.granted_scopes,
                 "user": self.recon_data.user.get("userPrincipalName") if self.recon_data.user else None,
@@ -1436,7 +1569,7 @@ def run_privesc_freestyle(token_mgr, max_turns: int = 8) -> Dict:
     """
     Freestyle, non-deterministic privilege-escalation hunt.
 
-    Hands the captured token to Foundation-Sec-8B (Sec8BExplorer) and lets it
+    Hands the captured token to Qwen3.8-27B-Uncensored (QwenExplorer) and lets it
     freely query Microsoft Graph to discover escalation routes on its own -
     independent of the deterministic EDGE_TABLE used by run_privesc().
 
@@ -1449,13 +1582,13 @@ def run_privesc_freestyle(token_mgr, max_turns: int = 8) -> Dict:
         free-form escalation paths with name/description/steps/probability/evidence).
     """
     try:
-        explorer = Sec8BExplorer(token_mgr)
+        explorer = QwenExplorer(token_mgr)
         explorer.MAX_TURNS = max(1, max_turns)
         paths = explorer.explore()
         return {
             "status": "success",
-            "method": "foundation-sec-8b-freestyle",
-            "model": SEC_MODEL,
+            "method": "qwen-27b-freestyle",
+            "model": QWEN_MODEL,
             "queries_explored": explorer.queries_made,
             "paths": paths,
             "path_count": len(paths),
@@ -1466,7 +1599,7 @@ def run_privesc_freestyle(token_mgr, max_turns: int = 8) -> Dict:
         return {
             "status": "error",
             "reason": str(e),
-            "method": "foundation-sec-8b-freestyle",
+            "method": "qwen-27b-freestyle",
             "paths": [],
             "path_count": 0,
         }
@@ -1519,7 +1652,7 @@ def main():
     print("""
     ╔═══════════════════════════════════════════════════════════════╗
     ║        PRIVILEGE ESCALATION ENGINE - AIlicit                  ║
-    ║        Deterministic Graph + Foundation-Sec-8B · Top 3        ║
+    ║        Deterministic Graph + Qwen3.8-27B-Uncensored · Top 3        ║
     ╚═══════════════════════════════════════════════════════════════╝
     """)
 
