@@ -28,7 +28,7 @@ CLIENT_ID = os.getenv("OAUTH_CLIENT_ID", "756b1e2d-0cd5-4ada-8bcc-a415b949216e")
 CLIENT_SECRET = os.getenv("OAUTH_CLIENT_SECRET", "")
 REDIRECT_URI = os.getenv(
     "OAUTH_REDIRECT_URI",
-    "https://f8e7-2601-19b-d86-32d0-dc82-3e12-1027-d696.ngrok-free.app/oauth/callback",
+    "https://c5b3-2601-19b-d86-32d0-f9da-f715-9cf6-ec04.ngrok-free.app/oauth/callback",
 )
 
 # OAuth scopes requested in the authorization URL (consent screen)
@@ -49,17 +49,32 @@ ORCAROUTER_ENDPOINT = "https://api.orcarouter.ai/v1/chat/completions"
 ORCAROUTER_API_KEY = os.getenv("ORCAROUTER_API_KEY", "")
 
 # ------------------------------------------------------------------
-# Foundation-Sec-8B (reasoning / path-selection analyst).
-# Optional layer - if not configured, Groq Llama-3.3-70b is used as
-# the fallback selector, and if that is also missing the agent falls
-# back to a purely deterministic (score-based) selection).
+# Foundation-Sec-1.1-8B — primary reasoning / path-selection analyst.
+# Optional layer: if not configured, Groq Llama-3.3-70b is used as
+# the fallback selector, and if that is also missing the engine falls
+# back to purely deterministic (score-based) selection.
 # Expects an OpenAI-compatible endpoint (local Ollama on 11434;
-# override with QWEN_BASE_URL, e.g. http://localhost:8080/v1 if you
+# override with SEC_BASE_URL, e.g. http://localhost:8080/v1 if you
 # front it with llama.cpp. The OAuth capture listener uses 8081).
 # ------------------------------------------------------------------
-QWEN_API_KEY = os.getenv("QWEN_API_KEY", "ollama")
-QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:11434/v1")
-QWEN_MODEL = os.getenv("QWEN_MODEL", "hf.co/fdtn-ai/Foundation-Sec-1.1-8B-Instruct-Q8_0-GGUF:Q8_0")
+SEC_API_KEY = os.getenv("SEC_API_KEY", "ollama")
+SEC_BASE_URL = os.getenv("SEC_BASE_URL", "http://localhost:11434/v1")
+SEC_MODEL = os.getenv("SEC_MODEL", "hf.co/fdtn-ai/Foundation-Sec-1.1-8B-Instruct-Q8_0-GGUF:Q8_0")
+
+# ------------------------------------------------------------------
+# Replanner — Qwen3.5-9B-Uncensored, used by the ReAct privesc agent
+# to re-plan after a failed step (and as the freestyle explorer).
+# Same Ollama endpoint by default; all LLM calls are serialized so the
+# two models never hit the API concurrently (see privesc.llm_call).
+# ------------------------------------------------------------------
+REPLAN_API_KEY = os.getenv("REPLAN_API_KEY", SEC_API_KEY)
+REPLAN_BASE_URL = os.getenv("REPLAN_BASE_URL", SEC_BASE_URL)
+REPLAN_MODEL = os.getenv("REPLAN_MODEL", "hf.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q8_0")
+
+# Backwards-compatible aliases (legacy QWEN_* names).
+QWEN_API_KEY = SEC_API_KEY
+QWEN_BASE_URL = SEC_BASE_URL
+QWEN_MODEL = SEC_MODEL
 
 # External address used as the forwarding target when auto-executing a
 # mail-forwarding persistence path. Override for your lab.

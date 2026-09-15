@@ -1,0 +1,138 @@
+{
+  "generated_at": "2026-09-15T15:57:51.597334",
+  "targets": [
+    {
+      "path_id": "edge_sp_app_role_abuse",
+      "name": "Service Principal High-Privilege App Role",
+      "description": "Exploit a high-privilege app role assigned to a service principal to escalate privileges.",
+      "source": "sec-analyst",
+      "execution_plan": [
+        {
+          "step": 1,
+          "action": "GET /servicePrincipals?$top=100&$select=id,displayName,appRoles",
+          "method": "graph",
+          "endpoint": "GET /servicePrincipals/{sp_id}/appRoleAssignments",
+          "verify": "Confirm the effect of: GET /servicePrincipals?$top=100&$select=id,displayName,appRoles",
+          "rollback": "Revert via inverse Graph call",
+          "dry_run_default": true
+        },
+        {
+          "step": 2,
+          "action": "GET /servicePrincipals/{sp_id}/appRoleAssignments",
+          "method": "graph",
+          "endpoint": "",
+          "verify": "Confirm the effect of: GET /servicePrincipals/{sp_id}/appRoleAssignments",
+          "rollback": "Revert via inverse Graph call",
+          "dry_run_default": true
+        },
+        {
+          "step": 3,
+          "action": "POST /appRoleAssignments",
+          "method": "graph",
+          "endpoint": "",
+          "verify": "Confirm the effect of: POST /appRoleAssignments",
+          "rollback": "Revert via inverse Graph call",
+          "dry_run_default": true
+        },
+        {
+          "step": 4,
+          "action": "GET /appRoleAssignments?$filter=principalId eq '<new>'",
+          "method": "graph",
+          "endpoint": "",
+          "verify": "Confirm the effect of: GET /appRoleAssignments?$filter=principalId eq '<new>'",
+          "rollback": "",
+          "dry_run_default": true
+        }
+      ],
+      "required_scopes": [
+        "Application.Read.All",
+        "User.Read"
+      ],
+      "gain": "App-role level directory write",
+      "evidence": {},
+      "reversible": true
+    },
+    {
+      "path_id": "edge_silent_delete",
+      "name": "Hidden Delete/Copy Rule",
+      "description": "Hidden Delete/Copy Rule: Create a hidden rule that silently deletes or copies mail (detection evasion / shadow mailbox)",
+      "source": "deterministic",
+      "execution_plan": [
+        {
+          "step": 1,
+          "action": "Verify granted scope: Mail.ReadWrite",
+          "method": "graph",
+          "endpoint": "POST /me/mailFolders/inbox/messageRules",
+          "verify": "Confirm the effect of: Verify granted scope: Mail.ReadWrite",
+          "rollback": "Revert via inverse Graph call",
+          "dry_run_default": true
+        },
+        {
+          "step": 2,
+          "action": "Hidden Delete/Copy Rule",
+          "method": "graph",
+          "endpoint": "",
+          "verify": "Confirm the effect of: Hidden Delete/Copy Rule",
+          "rollback": "Revert via inverse Graph call",
+          "dry_run_default": true
+        },
+        {
+          "step": 3,
+          "action": "POST /me/mailFolders/inbox/messageRules",
+          "method": "graph",
+          "endpoint": "",
+          "verify": "Confirm the effect of: POST /me/mailFolders/inbox/messageRules",
+          "rollback": "",
+          "dry_run_default": true
+        }
+      ],
+      "required_scopes": [
+        "Mail.ReadWrite"
+      ],
+      "gain": "Detection Evasion",
+      "evidence": {},
+      "reversible": true
+    },
+    {
+      "path_id": "edge_verified_domains",
+      "name": "Verified Domain Enumeration",
+      "description": "Verified Domain Enumeration: Enumerate org verified domains to surface additional phishable / mergeable tenant domains",
+      "source": "deterministic",
+      "execution_plan": [
+        {
+          "step": 1,
+          "action": "Verify granted scope: Directory.Read.All",
+          "method": "graph",
+          "endpoint": "GET /organization",
+          "verify": "Confirm the effect of: Verify granted scope: Directory.Read.All",
+          "rollback": "Revert via inverse Graph call",
+          "dry_run_default": true
+        },
+        {
+          "step": 2,
+          "action": "Verified Domain Enumeration",
+          "method": "graph",
+          "endpoint": "",
+          "verify": "Confirm the effect of: Verified Domain Enumeration",
+          "rollback": "Revert via inverse Graph call",
+          "dry_run_default": true
+        },
+        {
+          "step": 3,
+          "action": "GET /organization",
+          "method": "graph",
+          "endpoint": "",
+          "verify": "Confirm the effect of: GET /organization",
+          "rollback": "",
+          "dry_run_default": true
+        }
+      ],
+      "required_scopes": [
+        "Directory.Read.All"
+      ],
+      "gain": "Tenant Surface Expansion",
+      "evidence": {},
+      "reversible": true
+    }
+  ]
+}
